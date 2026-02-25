@@ -9,7 +9,7 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "LLMits",
-            path: "Sources/Perihelion",
+            path: "Sources/LLMits",
             resources: [
                 .process("Resources")
             ],
