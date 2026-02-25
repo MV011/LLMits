@@ -1,0 +1,25 @@
+# Swift / Xcode
+.build/
+.swiftpm/
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+
+# macOS
+.DS_Store
+*.swp
+*~
+
+# IDE
+.vscode/
+.idea/
+
+# Debug
+/tmp/llmits_debug.log
+
+# Dev scripts
+fetch_logos.py
+fix_svg_sizes.py
+test_image.swift
+test_svg_nsimage.swift
