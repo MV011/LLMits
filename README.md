@@ -37,11 +37,22 @@ A lightweight macOS menu bar app that tracks your AI coding tool usage and limit
 ```bash
 git clone https://github.com/MV011/LLMits.git
 cd LLMits
-swift build
-.build/debug/LLMits
+
+# Quick dev build
+swift build && .build/debug/LLMits
+
+# Build .app bundle and install to /Applications
+./build.sh --release --install
+
+# Launch from Applications
+open /Applications/LLMits.app
 ```
 
 The app appears as a gauge icon (⏱) in your menu bar. Click it to see your usage dashboard.
+
+### Launch at Login
+
+Open the settings page (⚙ icon) and toggle **"Launch at Login"** — uses macOS native login items, no launchd plists needed.
 
 ### Auto-Discovery
 

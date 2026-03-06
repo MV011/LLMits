@@ -1,4 +1,5 @@
 import SwiftUI
+import ServiceManagement
 
 enum PopoverPage {
     case dashboard
@@ -282,6 +283,41 @@ struct MenuBarPopover: View {
                     .padding(.vertical, 8)
                 }
             }
+
+            Spacer(minLength: 0)
+
+            // Launch at Login toggle
+            Divider()
+                .padding(.horizontal, 12)
+
+            HStack {
+                Image(systemName: "sunrise.fill")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.orange)
+                Text("Launch at Login")
+                    .font(.system(size: 12, weight: .medium, design: .rounded))
+
+                Spacer()
+
+                Toggle("", isOn: Binding(
+                    get: { SMAppService.mainApp.status == .enabled },
+                    set: { newValue in
+                        do {
+                            if newValue {
+                                try SMAppService.mainApp.register()
+                            } else {
+                                try SMAppService.mainApp.unregister()
+                            }
+                        } catch {
+                            debugLog("[Settings] launch at login error: \(error)")
+                        }
+                    }
+                ))
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
         }
     }
 
