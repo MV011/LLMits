@@ -1,6 +1,7 @@
 # Swift / Xcode
 .build/
 .swiftpm/
+*.app/
 *.xcodeproj/
 *.xcworkspace/
 xcuserdata/
