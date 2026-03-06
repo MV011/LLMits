@@ -119,10 +119,17 @@ class AccountsViewModel: ObservableObject {
     }
 
     private func loadAccounts() {
-        guard let data = UserDefaults.standard.data(forKey: accountsKey),
-              let saved = try? JSONDecoder().decode([Account].self, from: data) else {
+        debugLog("[Accounts] loadAccounts: domain=\(Bundle.main.bundleIdentifier ?? "nil")")
+        guard let data = UserDefaults.standard.data(forKey: accountsKey) else {
+            debugLog("[Accounts] no data for key '\(accountsKey)'")
             return
         }
+        debugLog("[Accounts] found \(data.count) bytes")
+        guard let saved = try? JSONDecoder().decode([Account].self, from: data) else {
+            debugLog("[Accounts] decode failed")
+            return
+        }
+        debugLog("[Accounts] loaded \(saved.count) accounts")
         accounts = saved
     }
 }
