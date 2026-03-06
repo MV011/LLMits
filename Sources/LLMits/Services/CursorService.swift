@@ -5,8 +5,13 @@ import Foundation
 struct CursorService: UsageService {
     private let usageURL = URL(string: "https://www.cursor.com/api/usage")!
     private let stripeURL = URL(string: "https://www.cursor.com/api/auth/stripe")!
+    private static let providerKey = "cursor"
 
     func fetchUsage(token: String) async throws -> [UsageGroup] {
+        if RateLimiter.shared.isLimited(Self.providerKey) {
+            throw ServiceError.httpError(429)
+        }
+
         let cookie = try resolveCookie(manualToken: token)
 
         // Fetch usage + stripe profile in parallel
@@ -16,6 +21,7 @@ struct CursorService: UsageService {
         let usage = try await usageData
         let stripe = try? await stripeData
 
+        RateLimiter.shared.clear(Self.providerKey)
         return parseUsage(usage, stripe: stripe)
     }
 
@@ -78,6 +84,12 @@ struct CursorService: UsageService {
         guard let httpResponse = response as? HTTPURLResponse else {
             throw ServiceError.invalidResponse
         }
+
+        if httpResponse.statusCode == 429 {
+            RateLimiter.shared.recordLimit(Self.providerKey)
+            throw ServiceError.httpError(429)
+        }
+
         guard httpResponse.statusCode == 200 else {
             throw ServiceError.httpError(httpResponse.statusCode)
         }

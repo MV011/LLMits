@@ -1,8 +1,62 @@
 import Foundation
 
-/// Shared time formatting utility for reset countdowns.
+/// Shared time formatting utility for reset countdowns and date parsing.
 enum TimeFormatter {
-    /// Format seconds remaining as "Xd Yh Zm", "Yh Zm", or "Zm".
+
+    // MARK: - ISO 8601 Parsing (cached formatters)
+
+    /// Parses an ISO 8601 date string, trying fractional seconds first.
+    static func parseISO8601(_ string: String) -> Date? {
+        _fractionalFormatter.date(from: string)
+            ?? _standardFormatter.date(from: string)
+    }
+
+    private static let _fractionalFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+
+    private static let _standardFormatter = ISO8601DateFormatter()
+
+    // MARK: - Stale/Fresh Window Detection
+
+    /// Determines the effective usage for a window, correcting for stale API data.
+    /// Returns the corrected `percentUsed` and an optional reset detail string.
+    ///
+    /// Handles two stale-data cases:
+    /// 1. Reset time is in the past → window already reset → 0% used.
+    /// 2. Shows 100% used but reset time is >80% of window away → fresh window → 0% used.
+    static func adjustForStaleReset(
+        percentUsed: Double,
+        resetDateString: String?,
+        windowSeconds: Double
+    ) -> (percentUsed: Double, resetDetail: String?) {
+        let adjusted = min(max(percentUsed, 0), 1)
+
+        guard let rs = resetDateString, let resetDate = parseISO8601(rs) else {
+            return (adjusted, nil)
+        }
+
+        let remaining = resetDate.timeIntervalSinceNow
+
+        // Reset time in the past — window already reset
+        if remaining <= 0 {
+            return (0, nil)
+        }
+
+        // API reports exhausted but reset time is almost a full window away → fresh window
+        if adjusted >= 1.0, remaining > windowSeconds * 0.8 {
+            return (0, nil)
+        }
+
+        let resetDetail = adjusted > 0 ? formatRemaining(remaining) : nil
+        return (adjusted, resetDetail)
+    }
+
+    // MARK: - Formatting
+
+    /// Format seconds remaining as "Resets in Xd Yh Zm", "Resets in Yh Zm", or "Resets in Zm".
     static func formatRemaining(_ seconds: TimeInterval) -> String? {
         guard seconds > 0 else { return nil }
 
@@ -31,9 +85,7 @@ enum TimeFormatter {
 
     /// Format from an ISO 8601 timestamp string.
     static func formatResetTime(isoString: String) -> String? {
-        let f1 = ISO8601DateFormatter()
-        f1.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = f1.date(from: isoString) ?? ISO8601DateFormatter().date(from: isoString) {
+        if let date = parseISO8601(isoString) {
             return formatRemaining(date.timeIntervalSinceNow)
         }
         // Try epoch seconds
@@ -42,4 +94,9 @@ enum TimeFormatter {
         }
         return nil
     }
+
+    // MARK: - Window Duration Constants
+
+    static let fiveHourSeconds: Double = 5 * 3600
+    static let weeklySeconds: Double = 7 * 24 * 3600
 }

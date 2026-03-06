@@ -1,11 +1,5 @@
 import Foundation
 
-enum KeychainError: Error {
-    case duplicateItem
-    case itemNotFound
-    case unexpectedStatus(OSStatus)
-}
-
 /// File-based token storage to avoid macOS Keychain prompts on debug builds.
 /// Stores tokens in ~/Library/Application Support/LLMits/tokens.json.
 /// This is used for LLMits's own account tokens only — Claude Code's
@@ -27,8 +21,7 @@ struct KeychainManager {
     }
 
     static func load(key: String) -> String? {
-        let store = loadStore()
-        return store[key]
+        loadStore()[key]
     }
 
     static func delete(key: String) {
@@ -51,6 +44,10 @@ struct KeychainManager {
         try? FileManager.default.createDirectory(at: storageDir, withIntermediateDirectories: true)
         if let data = try? JSONEncoder().encode(store) {
             try? data.write(to: storageFile, options: .atomic)
+            // Set owner-only permissions (0600)
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o600], ofItemAtPath: storageFile.path
+            )
         }
     }
 }

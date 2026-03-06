@@ -26,18 +26,34 @@ class UsageDashboardViewModel: ObservableObject {
         }
     }
 
+    private var lastDiscoveredServers: [AntigravityServerInfo] = []
+    private var lastDiscoveryTime: Date?
+
     func refreshAll(accounts: [Account]) {
+        // Guard against concurrent refreshes
+        guard !isRefreshing else {
+            debugLog("[Dashboard] skipping refresh — already in progress")
+            return
+        }
+
         Task {
             isRefreshing = true
             debugLog("[Dashboard] refreshAll with \(accounts.count) accounts")
 
-            // Pre-discover Antigravity servers BEFORE entering the task group.
-            // Process.waitUntilExit() deadlocks inside withTaskGroup child tasks
-            // because it conflicts with Swift's cooperative thread pool executor.
+            // Re-use cached Antigravity servers if discovered within last 60s
             let antigravityServers: [AntigravityServerInfo]
             if accounts.contains(where: { $0.provider == .antigravity }) {
-                antigravityServers = discoverAntigravityServers()
-                debugLog("[Dashboard] pre-discovered \(antigravityServers.count) Antigravity servers")
+                if let cached = lastDiscoveryTime,
+                   Date().timeIntervalSince(cached) < 60,
+                   !lastDiscoveredServers.isEmpty {
+                    antigravityServers = lastDiscoveredServers
+                    debugLog("[Dashboard] reusing \(antigravityServers.count) cached Antigravity servers")
+                } else {
+                    antigravityServers = discoverAntigravityServers()
+                    lastDiscoveredServers = antigravityServers
+                    lastDiscoveryTime = Date()
+                    debugLog("[Dashboard] discovered \(antigravityServers.count) Antigravity servers")
+                }
             } else {
                 antigravityServers = []
             }

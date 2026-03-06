@@ -4,13 +4,7 @@ struct UsageLimitRow: View {
     let limit: UsageLimit
     var accentColor: Color = .blue
 
-    private var barColor: Color {
-        let used = limit.percentUsed
-        if used < 0.5 { return .green }
-        if used < 0.75 { return .yellow }
-        if used < 0.9 { return .orange }
-        return .red
-    }
+    private var barColor: Color { limit.limitColor }
 
     private var remainingText: String {
         "\(Int(limit.percentRemaining * 100))% left"

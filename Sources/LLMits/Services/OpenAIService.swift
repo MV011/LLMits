@@ -2,9 +2,14 @@ import Foundation
 
 /// Fetches OpenAI Codex / ChatGPT usage via OAuth tokens from the Codex CLI.
 struct OpenAIService: UsageService {
+    private static let providerKey = "openai"
     private let usageURL = URL(string: "https://chatgpt.com/backend-api/wham/usage")!
 
     func fetchUsage(token: String) async throws -> [UsageGroup] {
+        if RateLimiter.shared.isLimited(Self.providerKey) {
+            throw ServiceError.httpError(429)
+        }
+
         let accessToken = try resolveAccessToken(manualToken: token)
 
         var request = URLRequest(url: usageURL)
@@ -13,15 +18,20 @@ struct OpenAIService: UsageService {
         request.timeoutInterval = 15
 
         let (data, response) = try await URLSession.shared.data(for: request)
-
         guard let httpResponse = response as? HTTPURLResponse else {
             throw ServiceError.invalidResponse
         }
-        guard httpResponse.statusCode == 200 else {
+
+        switch httpResponse.statusCode {
+        case 200:
+            RateLimiter.shared.clear(Self.providerKey)
+            return try parseUsageResponse(data)
+        case 429:
+            RateLimiter.shared.recordLimit(Self.providerKey)
+            throw ServiceError.httpError(429)
+        default:
             throw ServiceError.httpError(httpResponse.statusCode)
         }
-
-        return try parseUsageResponse(data)
     }
 
     // MARK: - Token Resolution
@@ -31,12 +41,12 @@ struct OpenAIService: UsageService {
             return manualToken
         }
 
-        if let cached = TokenCache.shared.get("openai") {
+        if let cached = TokenCache.shared.get(Self.providerKey) {
             return cached
         }
 
         if let token = loadFromAuthJSON() {
-            TokenCache.shared.set("openai", value: token)
+            TokenCache.shared.set(Self.providerKey, value: token)
             return token
         }
 
@@ -61,7 +71,6 @@ struct OpenAIService: UsageService {
                let token = tokens["access_token"] as? String ?? tokens["accessToken"] as? String {
                 return token
             }
-
             if let token = json["access_token"] as? String ?? json["accessToken"] as? String {
                 return token
             }
@@ -78,104 +87,32 @@ struct OpenAIService: UsageService {
 
         var groups: [UsageGroup] = []
 
-        // Parse rate_limit structure (actual Codex API format)
+        // Main rate limit
         if let rateLimit = json["rate_limit"] as? [String: Any] {
-            if let primary = rateLimit["primary_window"] as? [String: Any] {
-                let usedPct = primary["used_percent"] as? Double ?? 0
-                let resetText = TimeFormatter.formatResetTime(
-                    epochOrSeconds: primary["reset_at"] as? Double ?? primary["reset_after_seconds"] as? Double,
-                    isEpoch: primary["reset_at"] != nil)
-
-                groups.append(UsageGroup(name: "5-Hour Session", limits: [
-                    UsageLimit(name: "Codex 5h Limit", percentUsed: min(usedPct / 100.0, 1.0),
-                               detail: resetText, windowType: .fiveHour)
-                ]))
-            }
-
-            if let secondary = rateLimit["secondary_window"] as? [String: Any] {
-                let usedPct = secondary["used_percent"] as? Double ?? 0
-                let resetText = TimeFormatter.formatResetTime(
-                    epochOrSeconds: secondary["reset_at"] as? Double ?? secondary["reset_after_seconds"] as? Double,
-                    isEpoch: secondary["reset_at"] != nil)
-
-                groups.append(UsageGroup(name: "Weekly", limits: [
-                    UsageLimit(name: "Codex Weekly", percentUsed: min(usedPct / 100.0, 1.0),
-                               detail: resetText, windowType: .weekly)
-                ]))
-            }
+            groups += parseRateLimitBlock(rateLimit, namePrefix: "Codex")
         }
 
         // Additional rate limits (Spark, etc.)
-        if let additionalLimits = json["additional_rate_limits"] as? [[String: Any]] {
-            for additionalLimit in additionalLimits {
-                let limitName = additionalLimit["limit_name"] as? String ?? "Unknown"
-                guard let rl = additionalLimit["rate_limit"] as? [String: Any] else { continue }
-
-                if let primary = rl["primary_window"] as? [String: Any] {
-                    let usedPct = primary["used_percent"] as? Double ?? 0
-                    let resetText = TimeFormatter.formatResetTime(
-                        epochOrSeconds: primary["reset_at"] as? Double ?? primary["reset_after_seconds"] as? Double,
-                        isEpoch: primary["reset_at"] != nil)
-
-                    groups.append(UsageGroup(name: "\(limitName) — 5h", limits: [
-                        UsageLimit(name: limitName, percentUsed: min(usedPct / 100.0, 1.0),
-                                   detail: resetText, windowType: .fiveHour)
-                    ]))
-                }
-
-                if let secondary = rl["secondary_window"] as? [String: Any] {
-                    let usedPct = secondary["used_percent"] as? Double ?? 0
-                    let resetText = TimeFormatter.formatResetTime(
-                        epochOrSeconds: secondary["reset_at"] as? Double ?? secondary["reset_after_seconds"] as? Double,
-                        isEpoch: secondary["reset_at"] != nil)
-
-                    groups.append(UsageGroup(name: "\(limitName) — Weekly", limits: [
-                        UsageLimit(name: "\(limitName) Weekly", percentUsed: min(usedPct / 100.0, 1.0),
-                                   detail: resetText, windowType: .weekly)
-                    ]))
+        if let additional = json["additional_rate_limits"] as? [[String: Any]] {
+            for entry in additional {
+                let name = entry["limit_name"] as? String ?? "Unknown"
+                if let rl = entry["rate_limit"] as? [String: Any] {
+                    groups += parseRateLimitBlock(rl, namePrefix: name)
                 }
             }
         }
 
         // Code review rate limit
         if let codeReview = json["code_review_rate_limit"] as? [String: Any] {
-            if let primary = codeReview["primary_window"] as? [String: Any] {
-                let usedPct = primary["used_percent"] as? Double ?? 0
-                let resetText = TimeFormatter.formatResetTime(
-                    epochOrSeconds: primary["reset_at"] as? Double ?? primary["reset_after_seconds"] as? Double,
-                    isEpoch: primary["reset_at"] != nil)
-
-                groups.append(UsageGroup(name: "Code Review", limits: [
-                    UsageLimit(name: "Code Review", percentUsed: min(usedPct / 100.0, 1.0),
-                               detail: resetText, windowType: .unknown)
-                ]))
+            if let limit = parseRateWindow(codeReview["primary_window"] as? [String: Any],
+                                           name: "Code Review", windowType: .unknown) {
+                groups.append(UsageGroup(name: "Code Review", limits: [limit]))
             }
         }
 
         // Credits / balance
         if let credits = json["credits"] as? [String: Any] {
-            let balanceStr = credits["balance"] as? String ?? "0"
-            let balance = Double(balanceStr) ?? 0
-            let hasCredits = credits["has_credits"] as? Bool ?? false
-            let unlimited = credits["unlimited"] as? Bool ?? false
-
-            let detail: String
-            if unlimited {
-                detail = "Unlimited"
-            } else if hasCredits || balance > 0 {
-                detail = String(format: "$%.2f remaining", balance)
-            } else {
-                detail = "$0.00 remaining"
-            }
-
-            groups.append(UsageGroup(name: "Credits", limits: [
-                UsageLimit(
-                    name: "Credit Balance",
-                    percentUsed: (unlimited || balance > 0) ? 0 : 1.0,
-                    detail: detail,
-                    windowType: .monthly
-                )
-            ]))
+            groups.append(parseCredits(credits))
         }
 
         if groups.isEmpty {
@@ -187,5 +124,63 @@ struct OpenAIService: UsageService {
         }
 
         return groups
+    }
+
+    /// Parses a rate_limit block with primary + secondary windows.
+    private func parseRateLimitBlock(_ block: [String: Any], namePrefix: String) -> [UsageGroup] {
+        var groups: [UsageGroup] = []
+
+        if let limit = parseRateWindow(block["primary_window"] as? [String: Any],
+                                       name: "\(namePrefix) 5h Limit", windowType: .fiveHour) {
+            groups.append(UsageGroup(name: "\(namePrefix) — 5h", limits: [limit]))
+        }
+
+        if let limit = parseRateWindow(block["secondary_window"] as? [String: Any],
+                                       name: "\(namePrefix) Weekly", windowType: .weekly) {
+            groups.append(UsageGroup(name: "\(namePrefix) — Weekly", limits: [limit]))
+        }
+
+        return groups
+    }
+
+    /// Parses a single rate window (primary or secondary) into a UsageLimit.
+    private func parseRateWindow(_ window: [String: Any]?, name: String, windowType: UsageLimit.WindowType) -> UsageLimit? {
+        guard let window else { return nil }
+
+        let usedPct = window["used_percent"] as? Double ?? 0
+        let resetText = TimeFormatter.formatResetTime(
+            epochOrSeconds: window["reset_at"] as? Double ?? window["reset_after_seconds"] as? Double,
+            isEpoch: window["reset_at"] != nil
+        )
+
+        return UsageLimit(
+            name: name,
+            percentUsed: min(usedPct / 100.0, 1.0),
+            detail: resetText,
+            windowType: windowType
+        )
+    }
+
+    /// Parses the credits/balance section.
+    private func parseCredits(_ credits: [String: Any]) -> UsageGroup {
+        let balanceStr = credits["balance"] as? String ?? "0"
+        let balance = Double(balanceStr) ?? 0
+        let hasCredits = credits["has_credits"] as? Bool ?? false
+        let unlimited = credits["unlimited"] as? Bool ?? false
+
+        let detail: String
+        if unlimited {
+            detail = "Unlimited"
+        } else if hasCredits || balance > 0 {
+            detail = String(format: "$%.2f remaining", balance)
+        } else {
+            detail = "$0.00 remaining"
+        }
+
+        return UsageGroup(name: "Credits", limits: [
+            UsageLimit(name: "Credit Balance",
+                       percentUsed: (unlimited || balance > 0) ? 0 : 1.0,
+                       detail: detail, windowType: .monthly)
+        ])
     }
 }

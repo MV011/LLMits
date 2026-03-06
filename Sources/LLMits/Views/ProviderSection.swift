@@ -134,7 +134,6 @@ struct ProviderSection: View {
             .background(Capsule().fill(Color.red.opacity(0.12)))
         } else if provider == .antigravity {
             // Show two key model limits: Gemini Pro + Claude Opus
-            let allLimits = usages.flatMap { $0.groups.flatMap(\.limits) }
             let proLimit = allLimits.first { $0.name.lowercased().contains("3.1 pro") && $0.name.lowercased().contains("high") }
                 ?? allLimits.first { $0.name.lowercased().contains("pro") }
             let opusLimit = allLimits.first { $0.name.lowercased().contains("opus") }
@@ -148,29 +147,11 @@ struct ProviderSection: View {
                 }
             }
         } else if let fiveH = fiveHourLimit {
-            // Show 5h session % left (Codex)
-            let remaining = Int(fiveH.percentRemaining * 100)
-            let color = limitColor(for: fiveH.percentUsed)
-
-            Text("\(remaining)% left")
-                .font(.system(size: 9, weight: .bold, design: .monospaced))
-                .foregroundStyle(color)
-                .padding(.horizontal, 7)
-                .padding(.vertical, 3)
-                .background(Capsule().fill(color.opacity(0.12)))
+            percentBadge(remaining: Int(fiveH.percentRemaining * 100), color: fiveH.limitColor)
         } else {
-            // Fallback: show overall max used
-            let allLimits = usages.flatMap { $0.groups.flatMap(\.limits) }
             let maxUsed = allLimits.map(\.percentUsed).max() ?? 0
-            let remaining = Int((1.0 - maxUsed) * 100)
-            let color = limitColor(for: maxUsed)
-
-            Text("\(remaining)% left")
-                .font(.system(size: 9, weight: .bold, design: .monospaced))
-                .foregroundStyle(color)
-                .padding(.horizontal, 7)
-                .padding(.vertical, 3)
-                .background(Capsule().fill(color.opacity(0.12)))
+            let maxLimit = allLimits.first { $0.percentUsed == maxUsed }
+            percentBadge(remaining: Int((1.0 - maxUsed) * 100), color: maxLimit?.limitColor ?? .green)
         }
     }
 
@@ -227,28 +208,29 @@ struct ProviderSection: View {
         }
     }
 
-    private func limitColor(for used: Double) -> Color {
-        if used < 0.5 { return .green }
-        if used < 0.75 { return .yellow }
-        if used < 0.9 { return .orange }
-        return .red
+    private func percentBadge(remaining: Int, color: Color) -> some View {
+        Text("\(remaining)% left")
+            .font(.system(size: 9, weight: .bold, design: .monospaced))
+            .foregroundStyle(color)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(Capsule().fill(color.opacity(0.12)))
     }
 
     private func miniLimitBadge(label: String, limit: UsageLimit) -> some View {
         let remaining = Int(limit.percentRemaining * 100)
-        let color = limitColor(for: limit.percentUsed)
 
         return HStack(spacing: 2) {
             Text(label)
                 .font(.system(size: 8, weight: .medium, design: .rounded))
-                .foregroundStyle(color.opacity(0.7))
+                .foregroundStyle(limit.limitColor.opacity(0.7))
             Text("\(remaining)%")
                 .font(.system(size: 9, weight: .bold, design: .monospaced))
-                .foregroundStyle(color)
+                .foregroundStyle(limit.limitColor)
         }
         .padding(.horizontal, 6)
         .padding(.vertical, 3)
-        .background(Capsule().fill(color.opacity(0.12)))
+        .background(Capsule().fill(limit.limitColor.opacity(0.12)))
     }
 }
 

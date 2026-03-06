@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 
 struct UsageLimit: Identifiable {
     let id = UUID()
@@ -8,6 +9,14 @@ struct UsageLimit: Identifiable {
     let windowType: WindowType
 
     var percentRemaining: Double { 1.0 - percentUsed }
+
+    /// Color representing the usage level — shared across all views.
+    var limitColor: Color {
+        if percentUsed < 0.5 { return .green }
+        if percentUsed < 0.75 { return .yellow }
+        if percentUsed < 0.9 { return .orange }
+        return .red
+    }
 
     enum WindowType: String {
         case fiveHour = "5-hour"

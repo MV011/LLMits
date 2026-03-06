@@ -26,9 +26,7 @@ func discoverAntigravityServers() -> [AntigravityServerInfo] {
         return []
     }
 
-    // CRITICAL: Read the pipe BEFORE waitUntilExit().
-    // If ps output exceeds the pipe buffer (64KB), ps blocks on write
-    // while waitUntilExit() blocks waiting for ps to exit = deadlock.
+    // CRITICAL: Read pipe BEFORE waitUntilExit to avoid pipe buffer deadlock.
     let outputData = pipe.fileHandleForReading.readDataToEndOfFile()
     process.waitUntilExit()
 
@@ -63,19 +61,14 @@ func discoverAntigravityServers() -> [AntigravityServerInfo] {
 
 /// Fetches Antigravity quota by probing the local language server process.
 struct AntigravityService: UsageService {
-    /// Pre-resolved servers — set by the caller BEFORE entering a task group.
     var cachedServers: [AntigravityServerInfo] = []
 
     func fetchUsage(token: String) async throws -> [UsageGroup] {
         debugLog("[Antigravity] fetchUsage with \(cachedServers.count) cached servers")
 
         for (i, server) in cachedServers.enumerated() {
-            let portsToTry: [Int]
-            if let ep = server.extensionPort {
-                portsToTry = [ep + 1, ep + 2, ep, ep + 3]
-            } else {
-                continue
-            }
+            guard let ep = server.extensionPort else { continue }
+            let portsToTry = [ep + 1, ep + 2, ep, ep + 3]
 
             for port in portsToTry {
                 debugLog("[Antigravity] trying server[\(i)] port \(port)...")
@@ -126,8 +119,7 @@ struct AntigravityService: UsageService {
         ])
         request.timeoutInterval = 3
 
-        let session = Self._insecureSession
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await Self._insecureSession.data(for: request)
 
         guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
             throw ServiceError.httpError((response as? HTTPURLResponse)?.statusCode ?? 0)
@@ -143,41 +135,30 @@ struct AntigravityService: UsageService {
             throw ServiceError.parseError("Invalid response from Antigravity language server")
         }
 
-        var groups: [UsageGroup] = []
-
         let userStatus = json["userStatus"] as? [String: Any] ?? json
         let cascadeData = userStatus["cascadeModelConfigData"] as? [String: Any] ?? [:]
         let configs = cascadeData["clientModelConfigs"] as? [[String: Any]] ?? []
 
+        var groups: [UsageGroup] = []
+
         for config in configs {
-            guard let quotaInfo = config["quotaInfo"] as? [String: Any] else { continue }
-            let remaining = quotaInfo["remainingFraction"] as? Double ?? quotaInfo["remaining_fraction"] as? Double
-            guard let rem = remaining else { continue }
+            guard let quotaInfo = config["quotaInfo"] as? [String: Any],
+                  let remaining = quotaInfo["remainingFraction"] as? Double ?? quotaInfo["remaining_fraction"] as? Double else {
+                continue
+            }
 
             let label = config["label"] as? String ?? config["modelLabel"] as? String ?? "Unknown"
             let resetStr = quotaInfo["resetTime"] as? String ?? quotaInfo["reset_time"] as? String
 
-            // Check if the reset time is in the past — if so, the quota has reset
-            // and remainingFraction may be stale (0 = "starts on next message", not "exhausted")
-            var effectiveUsed = 1.0 - rem
-            var resetDetail: String? = nil
-            if let rs = resetStr {
-                let f1 = ISO8601DateFormatter()
-                f1.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-                let resetDate = f1.date(from: rs) ?? ISO8601DateFormatter().date(from: rs)
-                if let rd = resetDate {
-                    if rd.timeIntervalSinceNow <= 0 {
-                        // Reset time passed — quota is fresh, treat as 0% used
-                        effectiveUsed = 0
-                        resetDetail = nil
-                    } else {
-                        resetDetail = TimeFormatter.formatRemaining(rd.timeIntervalSinceNow)
-                    }
-                }
-            }
+            // Use shared stale-reset detection
+            let (adjustedUsed, resetDetail) = TimeFormatter.adjustForStaleReset(
+                percentUsed: 1.0 - remaining,
+                resetDateString: resetStr,
+                windowSeconds: TimeFormatter.fiveHourSeconds
+            )
 
             groups.append(UsageGroup(name: categorizeModel(label), limits: [
-                UsageLimit(name: label, percentUsed: effectiveUsed, detail: resetDetail, windowType: .fiveHour)
+                UsageLimit(name: label, percentUsed: adjustedUsed, detail: resetDetail, windowType: .fiveHour)
             ]))
         }
 
@@ -203,7 +184,7 @@ struct AntigravityService: UsageService {
         return label
     }
 
-    // MARK: - TLS
+    // MARK: - TLS (localhost self-signed cert)
 
     private static let _insecureSession: URLSession = {
         let config = URLSessionConfiguration.ephemeral
@@ -213,6 +194,7 @@ struct AntigravityService: UsageService {
     }()
 }
 
+/// Allows self-signed TLS certs for localhost connections only.
 private class InsecureTLSDelegate: NSObject, URLSessionDelegate {
     func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge) async -> (URLSession.AuthChallengeDisposition, URLCredential?) {
         if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
@@ -221,21 +203,5 @@ private class InsecureTLSDelegate: NSObject, URLSessionDelegate {
             return (.useCredential, URLCredential(trust: trust))
         }
         return (.performDefaultHandling, nil)
-    }
-}
-
-/// File-based debug logger that works for GUI apps.
-func debugLog(_ msg: String) {
-    let line = "\(Date()): \(msg)\n"
-    if let data = line.data(using: .utf8) {
-        if FileManager.default.fileExists(atPath: "/tmp/llmits_debug.log") {
-            if let fh = FileHandle(forWritingAtPath: "/tmp/llmits_debug.log") {
-                fh.seekToEndOfFile()
-                fh.write(data)
-                fh.closeFile()
-            }
-        } else {
-            FileManager.default.createFile(atPath: "/tmp/llmits_debug.log", contents: data)
-        }
     }
 }
