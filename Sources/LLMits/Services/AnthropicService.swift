@@ -6,28 +6,36 @@ import Security
 struct AnthropicService: UsageService {
     private let usageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
 
-    func fetchUsage(token: String) async throws -> [UsageGroup] {
-        let accessToken = try await resolveAccessToken(manualToken: token)
+    /// Tracks when we last got rate-limited to back off.
+    private static var rateLimitedUntil: Date?
 
+    func fetchUsage(token: String) async throws -> [UsageGroup] {
+        // Back off if we recently got rate-limited
+        if let until = Self.rateLimitedUntil, until.timeIntervalSinceNow > 0 {
+            debugLog("[Anthropic] backing off, rate limited for \(Int(until.timeIntervalSinceNow))s more")
+            throw ServiceError.httpError(429)
+        }
+
+        let accessToken = try await resolveAccessToken(manualToken: token)
         let (data, httpResponse) = try await makeUsageRequest(accessToken: accessToken)
 
-        // On 401, invalidate cache and try once more with a forced refresh
-        if httpResponse.statusCode == 401 {
-            debugLog("[Anthropic] got 401, invalidating cache and retrying...")
+        switch httpResponse.statusCode {
+        case 200:
+            return try parseUsageResponse(data)
+        case 401:
+            // Token expired — invalidate cache so next refresh gets a fresh one
+            debugLog("[Anthropic] got 401, invalidating cache for next refresh")
             TokenCache.shared.remove("anthropic")
-            let freshToken = try await resolveAccessToken(manualToken: token)
-            let (retryData, retryResponse) = try await makeUsageRequest(accessToken: freshToken)
-            guard retryResponse.statusCode == 200 else {
-                throw ServiceError.httpError(retryResponse.statusCode)
-            }
-            return try parseUsageResponse(retryData)
-        }
-
-        guard httpResponse.statusCode == 200 else {
+            TokenCache.shared.remove("anthropic_creds")
+            throw ServiceError.httpError(401)
+        case 429:
+            // Rate limited — back off for 60 seconds
+            debugLog("[Anthropic] got 429, backing off for 60s")
+            Self.rateLimitedUntil = Date().addingTimeInterval(60)
+            throw ServiceError.httpError(429)
+        default:
             throw ServiceError.httpError(httpResponse.statusCode)
         }
-
-        return try parseUsageResponse(data)
     }
 
     private func makeUsageRequest(accessToken: String) async throws -> (Data, HTTPURLResponse) {

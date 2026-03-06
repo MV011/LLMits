@@ -105,9 +105,15 @@ class UsageDashboardViewModel: ObservableObject {
     }
 
     func startAutoRefresh(accounts: [Account]) {
-        refreshTimer?.invalidate()
-        refreshAll(accounts: accounts)
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
+        // Only refresh if data is stale (>2 min since last refresh)
+        let isStale = lastRefreshed == nil || Date().timeIntervalSince(lastRefreshed!) > 120
+        if isStale {
+            refreshAll(accounts: accounts)
+        }
+
+        // Set up timer only if not already running (10 min interval)
+        guard refreshTimer == nil else { return }
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: 600, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.refreshAll(accounts: accounts)
             }
