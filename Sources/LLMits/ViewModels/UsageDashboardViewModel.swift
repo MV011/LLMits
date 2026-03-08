@@ -38,6 +38,7 @@ class UsageDashboardViewModel: ObservableObject {
 
         Task {
             isRefreshing = true
+            defer { isRefreshing = false }
             debugLog("[Dashboard] refreshAll with \(accounts.count) accounts")
 
             // Re-use cached Antigravity servers if discovered within last 60s
@@ -120,7 +121,6 @@ class UsageDashboardViewModel: ObservableObject {
             for item in self.usagesByProvider {
                 debugLog("[Dashboard]   provider=\(item.provider.rawValue) usages=\(item.usages.count) groups=\(item.usages.flatMap(\.groups).count) loading=\(item.usages.map(\.isLoading))")
             }
-            isRefreshing = false
             lastRefreshed = Date()
         }
     }

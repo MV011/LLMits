@@ -29,6 +29,9 @@ struct MenuBarPopover: View {
             accountsVM.runAutoDiscoveryIfNeeded()
             dashboardVM.startAutoRefresh(accounts: accountsVM.accounts)
         }
+        .onDisappear {
+            dashboardVM.stopAutoRefresh()
+        }
     }
 
     // MARK: - Dashboard

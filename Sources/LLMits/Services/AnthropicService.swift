@@ -3,6 +3,9 @@ import Security
 
 /// Fetches Claude usage via the Anthropic OAuth usage API.
 /// Reads credentials from macOS Keychain (Claude Code CLI) or ~/.claude/.credentials.json.
+///
+/// NOTE: We do NOT refresh OAuth tokens ourselves. Claude Code CLI manages
+/// its own token lifecycle. We just re-read from Keychain when expired.
 struct AnthropicService: UsageService {
     private static let providerKey = "anthropic"
     private let usageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
@@ -16,7 +19,7 @@ struct AnthropicService: UsageService {
             throw ServiceError.httpError(429)
         }
 
-        let accessToken = try await resolveAccessToken(manualToken: token)
+        let accessToken = try resolveAccessToken(manualToken: token)
         let (data, httpResponse) = try await makeRequest(accessToken: accessToken)
 
         switch httpResponse.statusCode {
@@ -24,13 +27,14 @@ struct AnthropicService: UsageService {
             RateLimiter.shared.clear(Self.providerKey)
             return try parseUsageResponse(data)
         case 401:
-            debugLog("[Anthropic] got 401, invalidating cache for next refresh")
+            // Token expired — clear cache, Claude Code CLI will refresh it
+            debugLog("[Anthropic] got 401, clearing cache (CLI will refresh token)")
             TokenCache.shared.remove(Self.providerKey)
             TokenCache.shared.remove("\(Self.providerKey)_creds")
             throw ServiceError.httpError(401)
         case 429:
-            debugLog("[Anthropic] got 429, backing off")
-            RateLimiter.shared.recordLimit(Self.providerKey)
+            debugLog("[Anthropic] got 429, backing off for 120s")
+            RateLimiter.shared.recordLimit(Self.providerKey, backoffSeconds: 120)
             throw ServiceError.httpError(429)
         default:
             throw ServiceError.httpError(httpResponse.statusCode)
@@ -57,11 +61,10 @@ struct AnthropicService: UsageService {
 
     private struct OAuthCredentials {
         let accessToken: String
-        let refreshToken: String
         let expiresAt: Double  // epoch milliseconds
     }
 
-    private func resolveAccessToken(manualToken: String) async throws -> String {
+    private func resolveAccessToken(manualToken: String) throws -> String {
         if manualToken != "mock-token" && !manualToken.isEmpty {
             return manualToken
         }
@@ -72,22 +75,23 @@ struct AnthropicService: UsageService {
             if cached.expiresAt > nowMs + 60_000 {
                 return cached.accessToken
             }
-            debugLog("[Anthropic] cached token expired, refreshing...")
-            if let refreshed = try? await refreshAccessToken(refreshToken: cached.refreshToken) {
-                return refreshed
-            }
-            debugLog("[Anthropic] refresh failed, will re-read credentials")
+            // Token expired — clear cache and re-read from Keychain
+            // Claude Code CLI handles its own token refresh
+            debugLog("[Anthropic] cached token expired, will re-read from Keychain")
             TokenCache.shared.remove("\(Self.providerKey)_creds")
             TokenCache.shared.remove(Self.providerKey)
         }
 
-        // First access or cache cleared — read from Keychain/file (may trigger one prompt)
+        // Read fresh credentials from Keychain/file
         guard let creds = Self.loadCredentials() else {
             throw ServiceError.noCredentials("Install Claude Code CLI and run 'claude' to login, or paste an OAuth token manually.")
         }
 
         // Cache in memory for subsequent calls
-        TokenCache.shared.setObject("\(Self.providerKey)_creds", value: creds)
+        TokenCache.shared.setObject("\(Self.providerKey)_creds", value: OAuthCredentials(
+            accessToken: creds.accessToken,
+            expiresAt: creds.expiresAt
+        ))
 
         let nowMs = Date().timeIntervalSince1970 * 1000
         if creds.expiresAt > nowMs + 60_000 {
@@ -95,19 +99,20 @@ struct AnthropicService: UsageService {
             return creds.accessToken
         }
 
-        // Token already expired — try to refresh
-        debugLog("[Anthropic] token from credentials already expired, refreshing...")
-        if let refreshed = try? await refreshAccessToken(refreshToken: creds.refreshToken) {
-            return refreshed
-        }
-
-        debugLog("[Anthropic] refresh failed, trying expired token")
+        // Token from Keychain is already expired — try it anyway
+        // (Claude Code CLI may not have refreshed yet)
+        debugLog("[Anthropic] token from Keychain already expired, using anyway")
         return creds.accessToken
     }
 
     // MARK: - Credentials Loading
 
-    private static func loadCredentials() -> OAuthCredentials? {
+    private struct FullCredentials {
+        let accessToken: String
+        let expiresAt: Double
+    }
+
+    private static func loadCredentials() -> FullCredentials? {
         // Try Keychain first
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -121,7 +126,7 @@ struct AnthropicService: UsageService {
 
         if status == errSecSuccess, let data = result as? Data,
            let jsonStr = String(data: data, encoding: .utf8),
-           let creds = parseOAuthCredentials(jsonStr) {
+           let creds = parseCredentials(jsonStr) {
             return creds
         }
 
@@ -133,7 +138,7 @@ struct AnthropicService: UsageService {
         ] {
             if let data = try? Data(contentsOf: path),
                let jsonStr = String(data: data, encoding: .utf8),
-               let creds = parseOAuthCredentials(jsonStr) {
+               let creds = parseCredentials(jsonStr) {
                 return creds
             }
         }
@@ -141,100 +146,20 @@ struct AnthropicService: UsageService {
         return nil
     }
 
-    private static func parseOAuthCredentials(_ json: String) -> OAuthCredentials? {
+    private static func parseCredentials(_ json: String) -> FullCredentials? {
         guard let data = json.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
         }
 
-        // Claude Code stores tokens under "claudeAiOauth"
         let source = (obj["claudeAiOauth"] as? [String: Any]) ?? obj
 
         guard let access = source["accessToken"] as? String ?? source["access_token"] as? String else {
             return nil
         }
 
-        let refresh = source["refreshToken"] as? String ?? source["refresh_token"] as? String ?? ""
         let expires = source["expiresAt"] as? Double ?? 0
-        return OAuthCredentials(accessToken: access, refreshToken: refresh, expiresAt: expires)
-    }
-
-    // MARK: - Token Refresh
-
-    private func refreshAccessToken(refreshToken: String) async throws -> String {
-        guard !refreshToken.isEmpty else {
-            throw ServiceError.noCredentials("No refresh token available")
-        }
-
-        let url = URL(string: "https://console.anthropic.com/v1/oauth/token")!
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 10
-        request.httpBody = try JSONSerialization.data(withJSONObject: [
-            "grant_type": "refresh_token",
-            "refresh_token": refreshToken,
-        ])
-
-        let (data, response) = try await URLSession.shared.data(for: request)
-
-        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-            throw ServiceError.httpError(code)
-        }
-
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let newAccessToken = json["access_token"] as? String else {
-            throw ServiceError.parseError("Invalid refresh response")
-        }
-
-        let newRefreshToken = json["refresh_token"] as? String ?? refreshToken
-        let expiresIn = json["expires_in"] as? Double ?? 3600
-        let newExpiresAt = (Date().timeIntervalSince1970 + expiresIn) * 1000
-
-        // Update in-memory cache
-        TokenCache.shared.set(Self.providerKey, value: newAccessToken)
-        TokenCache.shared.setObject("\(Self.providerKey)_creds", value: OAuthCredentials(
-            accessToken: newAccessToken, refreshToken: newRefreshToken, expiresAt: newExpiresAt
-        ))
-
-        // Update Keychain in background
-        Self.updateKeychainTokens(accessToken: newAccessToken, refreshToken: newRefreshToken, expiresAt: newExpiresAt)
-        debugLog("[Anthropic] token refreshed successfully")
-
-        return newAccessToken
-    }
-
-    private static func updateKeychainTokens(accessToken: String, refreshToken: String, expiresAt: Double) {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-
-        var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess, let data = result as? Data,
-              let jsonStr = String(data: data, encoding: .utf8),
-              let jsonData = jsonStr.data(using: .utf8),
-              var obj = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
-            return
-        }
-
-        if var claudeOAuth = obj["claudeAiOauth"] as? [String: Any] {
-            claudeOAuth["accessToken"] = accessToken
-            claudeOAuth["refreshToken"] = refreshToken
-            claudeOAuth["expiresAt"] = expiresAt
-            obj["claudeAiOauth"] = claudeOAuth
-        }
-
-        guard let updatedData = try? JSONSerialization.data(withJSONObject: obj) else { return }
-        let updateQuery: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-        ]
-        SecItemUpdate(updateQuery as CFDictionary, [kSecValueData as String: updatedData] as CFDictionary)
+        return FullCredentials(accessToken: access, expiresAt: expires)
     }
 
     // MARK: - Response Parsing
