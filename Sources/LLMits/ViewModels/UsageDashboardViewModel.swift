@@ -115,6 +115,11 @@ class UsageDashboardViewModel: ObservableObject {
             }
 
             debugLog("[Dashboard] all tasks completed")
+            debugLog("[Dashboard] accountUsages count=\(self.accountUsages.count), total groups=\(self.accountUsages.flatMap(\.groups).count)")
+            debugLog("[Dashboard] usagesByProvider count=\(self.usagesByProvider.count)")
+            for item in self.usagesByProvider {
+                debugLog("[Dashboard]   provider=\(item.provider.rawValue) usages=\(item.usages.count) groups=\(item.usages.flatMap(\.groups).count) loading=\(item.usages.map(\.isLoading))")
+            }
             isRefreshing = false
             lastRefreshed = Date()
         }

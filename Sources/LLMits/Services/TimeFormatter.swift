@@ -45,8 +45,10 @@ enum TimeFormatter {
             return (0, nil)
         }
 
-        // API reports exhausted but reset time is almost a full window away → fresh window
-        if adjusted >= 1.0, remaining > windowSeconds * 0.8 {
+        // API reports exhausted but reset time is nearly a full window away.
+        // This means the window JUST started (fresh reset), not actually exhausted.
+        // Use 98% threshold: for weekly = ~3.4h margin, for 5h = ~6min margin.
+        if adjusted >= 1.0, remaining > windowSeconds * 0.98 {
             return (0, nil)
         }
 

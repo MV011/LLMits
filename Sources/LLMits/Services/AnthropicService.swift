@@ -295,12 +295,15 @@ struct AnthropicService: UsageService {
 
         let windowSeconds: Double = (windowType == .weekly) ? TimeFormatter.weeklySeconds : TimeFormatter.fiveHourSeconds
 
+        debugLog("[Anthropic] parseWindow '\(name)': utilization=\(window["utilization"] ?? "nil"), percent_used=\(window["percent_used"] ?? "nil"), resets_at=\(resetStr ?? "nil")")
+
         // Try "utilization" field
         if let utilization = window["utilization"] as? Double {
             let normalized = utilization > 1.0 ? utilization / 100.0 : utilization
             let (adjusted, detail) = TimeFormatter.adjustForStaleReset(
                 percentUsed: normalized, resetDateString: resetStr, windowSeconds: windowSeconds
             )
+            debugLog("[Anthropic]   '\(name)' result: raw=\(normalized) adjusted=\(adjusted) detail=\(detail ?? "nil")")
             return UsageLimit(name: name, percentUsed: adjusted, detail: detail, windowType: windowType)
         }
 
