@@ -26,7 +26,8 @@ enum TimeFormatter {
     ///
     /// Handles two stale-data cases:
     /// 1. Reset time is in the past → window already reset → 0% used.
-    /// 2. Shows 100% used but reset time is >80% of window away → fresh window → 0% used.
+    /// 2. Shows 100% used but less than 30 min elapsed in current window
+    ///    → stale data from previous window → 0% used.
     static func adjustForStaleReset(
         percentUsed: Double,
         resetDateString: String?,
@@ -45,10 +46,12 @@ enum TimeFormatter {
             return (0, nil)
         }
 
-        // API reports exhausted but reset time is nearly a full window away.
-        // This means the window JUST started (fresh reset), not actually exhausted.
-        // Use 98% threshold: for weekly = ~3.4h margin, for 5h = ~6min margin.
-        if adjusted >= 1.0, remaining > windowSeconds * 0.98 {
+        // API reports exhausted but we're very early in the current window.
+        // This means the window JUST reset and the API is showing stale data
+        // from the previous window. 30 min covers the typical API staleness.
+        let elapsed = windowSeconds - remaining
+        if adjusted >= 1.0, elapsed < 1800 {
+            debugLog("[TimeFormatter] stale-reset detected: elapsed=\(Int(elapsed))s < 1800s, zeroing out")
             return (0, nil)
         }
 
