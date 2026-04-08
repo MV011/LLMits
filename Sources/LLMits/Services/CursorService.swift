@@ -9,7 +9,8 @@ struct CursorService: UsageService {
     private static let providerKey = "cursor"
 
     // IMPORTANT: cursor.com without www — www.cursor.com returns 308 redirects
-    private let usageURL = URL(string: "https://cursor.com/api/dashboard/get-current-period-usage")!
+    private let usageSummaryURL = URL(string: "https://cursor.com/api/usage-summary")!
+    private let planInfoURL = URL(string: "https://cursor.com/api/dashboard/get-plan-info")!
     private let stripeURL = URL(string: "https://cursor.com/api/auth/stripe")!
 
     func fetchUsage(token: String) async throws -> [UsageGroup] {
@@ -43,14 +44,17 @@ struct CursorService: UsageService {
 
     /// Core fetch logic — separated so we can retry with fresh credentials.
     private func fetchWithCookie(_ cookie: String) async throws -> [UsageGroup] {
-        async let periodData = fetchPeriodUsage(cookie: cookie)
+        // Fetch all endpoints in parallel
+        async let summaryData = fetchUsageSummary(cookie: cookie)
+        async let planData = fetchPlanInfo(cookie: cookie)
         async let stripeData = fetchStripe(cookie: cookie)
 
-        let period = try await periodData
+        let summary = try await summaryData
+        let planInfo = try? await planData
         let stripe = try? await stripeData
 
         RateLimiter.shared.clear(Self.providerKey)
-        return parsePeriodUsage(period, stripe: stripe)
+        return parseUsageSummary(summary, planInfo: planInfo, stripe: stripe)
     }
 
     // MARK: - Cookie Resolution
@@ -156,17 +160,26 @@ struct CursorService: UsageService {
         return buildCookieFromDB() != nil ? "found" : nil
     }
 
-    // MARK: - Networking
+    private func fetchUsageSummary(cookie: String) async throws -> [String: Any] {
+        var request = URLRequest(url: usageSummaryURL)
+        request.setValue(cookie, forHTTPHeaderField: "Cookie")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("https://cursor.com", forHTTPHeaderField: "Origin")
+        request.setValue("https://cursor.com/dashboard/usage", forHTTPHeaderField: "Referer")
+        request.timeoutInterval = 10
 
-    private func fetchPeriodUsage(cookie: String) async throws -> [String: Any] {
-        var request = URLRequest(url: usageURL)
+        return try await performRequest(request, cookie: cookie)
+    }
+
+    private func fetchPlanInfo(cookie: String) async throws -> [String: Any] {
+        var request = URLRequest(url: planInfoURL)
         request.httpMethod = "POST"
         request.httpBody = "{}".data(using: .utf8)
         request.setValue(cookie, forHTTPHeaderField: "Cookie")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("*/*", forHTTPHeaderField: "Accept")
         request.setValue("https://cursor.com", forHTTPHeaderField: "Origin")
-        request.setValue("https://cursor.com/dashboard/spending", forHTTPHeaderField: "Referer")
+        request.setValue("https://cursor.com/dashboard/usage", forHTTPHeaderField: "Referer")
         request.timeoutInterval = 10
 
         return try await performRequest(request, cookie: cookie)
@@ -227,108 +240,128 @@ struct CursorService: UsageService {
 
     // MARK: - Parsing
 
-    private func parsePeriodUsage(_ period: [String: Any], stripe: [String: Any]?) -> [UsageGroup] {
+    /// Parse the usage-summary response. Handles both individual and team plans.
+    ///
+    /// Team plan response has:
+    ///   - limitType: "team"
+    ///   - individualUsage.plan (included credits)
+    ///   - individualUsage.onDemand (personal overage)
+    ///   - teamUsage.onDemand (team total spend)
+    ///
+    /// Individual plan response has:
+    ///   - limitType: "individual" or absent
+    ///   - Same individualUsage structure but no teamUsage
+    private func parseUsageSummary(
+        _ summary: [String: Any],
+        planInfo: [String: Any]?,
+        stripe: [String: Any]?
+    ) -> [UsageGroup] {
         var limits: [UsageLimit] = []
 
-        // Plan name from stripe
-        let membershipType = stripe?["membershipType"] as? String ?? "ultra"
-        let planName = formatPlanName(membershipType)
-        let isOnBillableAuto = stripe?["isOnBillableAuto"] as? Bool ?? false
+        // --- Determine plan name ---
+        let planInfoObj = planInfo?["planInfo"] as? [String: Any]
+        let planDisplayName = planInfoObj?["planName"] as? String
+        let planPrice = planInfoObj?["price"] as? String
+        let membershipType = summary["membershipType"] as? String ?? stripe?["membershipType"] as? String ?? ""
+        let limitType = summary["limitType"] as? String ?? "individual"
+        let isTeam = limitType == "team"
 
-        // Billing cycle dates (timestamps in milliseconds)
-        let cycleEndMs = (period["billingCycleEnd"] as? String).flatMap { Double($0) }
+        let planName: String
+        if let name = planDisplayName {
+            planName = "Cursor \(name)"
+        } else {
+            planName = formatPlanName(membershipType)
+        }
+
+        // --- Billing cycle reset ---
+        let cycleEnd = summary["billingCycleEnd"] as? String
         var resetDetail: String? = nil
-        if let endMs = cycleEndMs {
-            let endDate = Date(timeIntervalSince1970: endMs / 1000)
+        if let endStr = cycleEnd, let endDate = parseISO8601(endStr), endDate > Date() {
             resetDetail = TimeFormatter.formatRemaining(endDate.timeIntervalSinceNow)
         }
+        // Fallback: try planInfo's billingCycleEnd (ms timestamp)
+        if resetDetail == nil, let endMs = (planInfoObj?["billingCycleEnd"] as? String).flatMap({ Double($0) }) {
+            let endDate = Date(timeIntervalSince1970: endMs / 1000)
+            if endDate > Date() {
+                resetDetail = TimeFormatter.formatRemaining(endDate.timeIntervalSinceNow)
+            }
+        }
 
-        // Parse planUsage
-        if let planUsage = period["planUsage"] as? [String: Any] {
-            let totalSpend = planUsage["totalSpend"] as? Int ?? 0
+        // --- Individual usage ---
+        let individual = summary["individualUsage"] as? [String: Any]
+        let planUsage = individual?["plan"] as? [String: Any]
+        let onDemand = individual?["onDemand"] as? [String: Any]
+
+        // Included plan usage
+        if let planUsage {
+            let used = planUsage["used"] as? Int ?? 0
             let limit = planUsage["limit"] as? Int ?? 0
-            let remaining = planUsage["remaining"] as? Int ?? 0
+            let apiPct = planUsage["apiPercentUsed"] as? Double ?? 0
 
-            // These are credit-unit values (not cents) — display as percentage
-            let autoPercent = planUsage["autoPercentUsed"] as? Double ?? 0
-            let apiPercent = planUsage["apiPercentUsed"] as? Double ?? 0
-
-            // --- Total usage bar ---
             if limit > 0 {
-                let pct = min(Double(totalSpend) / Double(limit), 1.0)
-                let spent = formatCredits(totalSpend)
-                let cap = formatCredits(limit)
-                var detail = "\(spent) / \(cap) credits used"
-                if let rd = resetDetail { detail += " · \(rd)" }
+                let pct = min(Double(used) / Double(limit), 1.0)
+                var detail = "\(formatCents(used)) / \(formatCents(limit)) included"
+                if let rd = resetDetail { detail += " · Resets in \(rd)" }
                 limits.append(UsageLimit(
-                    name: "Total Usage",
+                    name: "Included Usage",
                     percentUsed: pct,
                     detail: detail,
                     windowType: .monthly
                 ))
             }
 
-            // --- Auto mode usage ---
-            if autoPercent > 0 {
-                let autoMsg = period["autoModelSelectedDisplayMessage"] as? String
-                var detail = autoMsg ?? String(format: "%.1f%% of included usage", autoPercent)
-                if let rd = resetDetail, autoMsg == nil { detail += " · \(rd)" }
-                limits.append(UsageLimit(
-                    name: "Auto Mode",
-                    percentUsed: min(autoPercent / 100.0, 1.0),
-                    detail: detail,
-                    windowType: .monthly
-                ))
-            }
-
-            // --- API/Premium model usage ---
-            if apiPercent > 0 {
-                let apiMsg = period["namedModelSelectedDisplayMessage"] as? String
-                var detail = apiMsg ?? String(format: "%.1f%% of included API usage", apiPercent)
-                if let rd = resetDetail, apiMsg == nil { detail += " · \(rd)" }
+            // Premium/API model bar — only if non-trivial and different from total
+            if apiPct > 0 && apiPct != (planUsage["totalPercentUsed"] as? Double ?? 0) {
+                let apiMsg = summary["namedModelSelectedDisplayMessage"] as? String
+                let detail = apiMsg ?? String(format: "%.0f%% of included API usage", apiPct)
                 limits.append(UsageLimit(
                     name: "Premium Models",
-                    percentUsed: min(apiPercent / 100.0, 1.0),
+                    percentUsed: min(apiPct / 100.0, 1.0),
                     detail: detail,
                     windowType: .monthly
                 ))
             }
+        }
 
-            // --- Remaining credits ---
-            if remaining > 0 && limit > 0 {
-                let remPercent = Double(remaining) / Double(limit)
+        // Individual on-demand (overage)
+        if let onDemand, onDemand["enabled"] as? Bool == true {
+            let usedCents = onDemand["used"] as? Int ?? 0
+            if usedCents > 0 {
+                // On-demand has no limit — show as spend bar
                 limits.append(UsageLimit(
-                    name: "Remaining",
-                    percentUsed: 1.0 - remPercent,
-                    detail: "\(formatCredits(remaining)) credits remaining",
+                    name: "Overage (You)",
+                    percentUsed: 0, // no cap to measure against
+                    detail: "\(formatCents(usedCents)) on-demand spend",
                     windowType: .monthly
                 ))
             }
         }
 
-        // --- Spend limit ---
-        if let spendLimit = period["spendLimitUsage"] as? [String: Any] {
-            let individualLimit = spendLimit["individualLimit"] as? Int ?? 0
-            let individualRemaining = spendLimit["individualRemaining"] as? Int ?? 0
-
-            if individualLimit > 0 {
-                let used = individualLimit - individualRemaining
-                let pct = min(Double(used) / Double(individualLimit), 1.0)
+        // --- Team usage (team plans only) ---
+        if isTeam, let teamUsage = summary["teamUsage"] as? [String: Any] {
+            let teamOnDemand = teamUsage["onDemand"] as? [String: Any]
+            let teamUsedCents = teamOnDemand?["used"] as? Int ?? 0
+            if teamUsedCents > 0 {
                 limits.append(UsageLimit(
-                    name: "Spend Limit",
-                    percentUsed: pct,
-                    detail: "\(formatCredits(used)) / \(formatCredits(individualLimit)) spend cap",
+                    name: "Team Total",
+                    percentUsed: 0, // no cap
+                    detail: "\(formatCents(teamUsedCents)) total team spend",
                     windowType: .monthly
                 ))
             }
         }
 
-        // --- Overage billing ---
-        if isOnBillableAuto {
+        // --- Plan info badge ---
+        if let price = planPrice {
+            let includedCents = planInfoObj?["includedAmountCents"] as? Int ?? 0
+            var detail = price
+            if includedCents > 0 {
+                detail += " (\(formatCents(includedCents)) included)"
+            }
             limits.append(UsageLimit(
-                name: "Overage Billing",
+                name: "Plan",
                 percentUsed: 0,
-                detail: "Pay-as-you-go enabled",
+                detail: detail,
                 windowType: .monthly
             ))
         }
@@ -349,6 +382,7 @@ struct CursorService: UsageService {
 
     private func formatPlanName(_ type: String) -> String {
         let lower = type.lowercased()
+        if lower.contains("enterprise") { return "Cursor Team" }
         if lower.contains("ultra") { return "Cursor Ultra" }
         if lower.contains("pro_plus") || lower.contains("pro+") { return "Cursor Pro+" }
         if lower.contains("pro") { return "Cursor Pro" }
@@ -357,13 +391,22 @@ struct CursorService: UsageService {
         return type.isEmpty ? "Cursor" : "Cursor \(type.capitalized)"
     }
 
-    /// Format credit units as readable strings
-    /// Credit units appear to be in hundredths (e.g., 40000 = $400.00 or 400 credits)
-    private func formatCredits(_ value: Int) -> String {
-        let dollars = Double(value) / 100.0
-        if dollars == Double(Int(dollars)) {
-            return String(format: "$%.0f", dollars)
-        }
-        return String(format: "$%.2f", dollars)
+    /// Format cent values as dollar strings.
+    /// API values are in cents: 976970 → $9,769.70
+    private func formatCents(_ cents: Int) -> String {
+        let dollars = Double(cents) / 100.0
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .currency
+        formatter.currencyCode = "USD"
+        formatter.maximumFractionDigits = dollars == Double(Int(dollars)) ? 0 : 2
+        return formatter.string(from: NSNumber(value: dollars)) ?? String(format: "$%.2f", dollars)
+    }
+
+    private func parseISO8601(_ str: String) -> Date? {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = formatter.date(from: str) { return d }
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: str)
     }
 }
