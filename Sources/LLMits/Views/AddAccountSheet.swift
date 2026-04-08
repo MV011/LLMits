@@ -112,19 +112,47 @@ struct AddAccountView: View {
 
                     // Token
                     VStack(alignment: .leading, spacing: 6) {
-                        Text("SESSION TOKEN")
-                            .font(.system(size: 10, weight: .bold, design: .rounded))
-                            .foregroundStyle(.secondary)
-                            .padding(.leading, 2)
+                        if selectedProvider.isAutoDiscovered {
+                            // Auto-discovered provider — no manual token needed
+                            HStack(spacing: 6) {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .font(.system(size: 14))
+                                    .foregroundStyle(.green)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("AUTO-DISCOVERED")
+                                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                                        .foregroundStyle(.green)
+                                    Text(selectedProvider.tokenLabel)
+                                        .font(.system(size: 10, design: .rounded))
+                                        .foregroundStyle(.tertiary)
+                                }
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 10)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .fill(Color.green.opacity(0.06))
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 8)
+                                            .strokeBorder(Color.green.opacity(0.2), lineWidth: 1)
+                                    )
+                            )
+                        } else {
+                            Text("SESSION TOKEN")
+                                .font(.system(size: 10, weight: .bold, design: .rounded))
+                                .foregroundStyle(.secondary)
+                                .padding(.leading, 2)
 
-                        Text(selectedProvider.tokenLabel)
-                            .font(.system(size: 10, design: .rounded))
-                            .foregroundStyle(.tertiary)
-                            .padding(.leading, 2)
+                            Text(selectedProvider.tokenLabel)
+                                .font(.system(size: 10, design: .rounded))
+                                .foregroundStyle(.tertiary)
+                                .padding(.leading, 2)
 
-                        SecureField("Paste token here…", text: $token)
-                            .font(.system(size: 12, design: .rounded))
-                            .textFieldStyle(.roundedBorder)
+                            SecureField("Paste token here…", text: $token)
+                                .font(.system(size: 12, design: .rounded))
+                                .textFieldStyle(.roundedBorder)
+                        }
                     }
                 }
                 .padding(.horizontal, 16)

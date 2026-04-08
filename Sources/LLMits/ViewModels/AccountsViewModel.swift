@@ -9,7 +9,8 @@ class AccountsViewModel: ObservableObject {
     }
 
     private let accountsKey = "llmits.accounts"
-    private let hasRunAutoDiscoveryKey = "llmits.hasRunAutoDiscovery"
+    // Bump the version suffix when new auto-discoverable providers are added
+    private let hasRunAutoDiscoveryKey = "llmits.hasRunAutoDiscovery.v2"
 
     init() {
         loadAccounts()
@@ -26,20 +27,25 @@ class AccountsViewModel: ObservableObject {
             let hasCodex = Self.hasCodexCredentials()
             let hasAntigravity = Self.isAntigravityRunning()
             let hasCursor = CursorService.readCursorJWT() != nil
+            let hasGeminiCLI = Self.hasGeminiCLICredentials()
 
+            // Capture weak self before entering MainActor context
+            guard let vm = self else { return }
             await MainActor.run {
-                guard let self = self else { return }
-                if hasClaude && self.accountsFor(provider: .anthropic).isEmpty {
-                    self.addAccount(provider: .anthropic, displayName: "Claude Code", token: "mock-token")
+                if hasClaude && vm.accountsFor(provider: .anthropic).isEmpty {
+                    vm.addAccount(provider: .anthropic, displayName: "Claude Code", token: "mock-token")
                 }
-                if hasCodex && self.accountsFor(provider: .openai).isEmpty {
-                    self.addAccount(provider: .openai, displayName: "Codex CLI", token: "mock-token")
+                if hasCodex && vm.accountsFor(provider: .openai).isEmpty {
+                    vm.addAccount(provider: .openai, displayName: "Codex CLI", token: "mock-token")
                 }
-                if hasAntigravity && self.accountsFor(provider: .antigravity).isEmpty {
-                    self.addAccount(provider: .antigravity, displayName: "Antigravity", token: "mock-token")
+                if hasAntigravity && vm.accountsFor(provider: .antigravity).isEmpty {
+                    vm.addAccount(provider: .antigravity, displayName: "Antigravity", token: "mock-token")
                 }
-                if hasCursor && self.accountsFor(provider: .cursor).isEmpty {
-                    self.addAccount(provider: .cursor, displayName: "Cursor", token: "mock-token")
+                if hasGeminiCLI && vm.accountsFor(provider: .geminiCLI).isEmpty {
+                    vm.addAccount(provider: .geminiCLI, displayName: "Gemini CLI", token: "auto")
+                }
+                if hasCursor && vm.accountsFor(provider: .cursor).isEmpty {
+                    vm.addAccount(provider: .cursor, displayName: "Cursor", token: "mock-token")
                 }
             }
         }
@@ -108,6 +114,12 @@ class AccountsViewModel: ObservableObject {
 
         let output = String(data: outputData, encoding: .utf8) ?? ""
         return output.contains("language_server_macos") && output.contains("antigravity")
+    }
+
+    nonisolated private static func hasGeminiCLICredentials() -> Bool {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let credsPath = home.appendingPathComponent(".gemini/oauth_creds.json").path
+        return FileManager.default.fileExists(atPath: credsPath)
     }
 
     // MARK: - Persistence

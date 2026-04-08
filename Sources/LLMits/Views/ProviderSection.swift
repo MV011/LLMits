@@ -19,14 +19,13 @@ struct ProviderSection: View {
         allLimits.contains { $0.windowType == .fiveHour && $0.percentUsed >= 1.0 }
     }
 
-    /// For multi-model providers (Antigravity): ALL pinned models exhausted
+    /// For multi-model providers (Antigravity): Gemini Pro AND Cloud both exhausted
     private var isAllPinnedExhausted: Bool {
         guard provider == .antigravity else { return false }
-        let pro = allLimits.first { $0.name.lowercased().contains("3.1 pro") && $0.name.lowercased().contains("high") }
-            ?? allLimits.first { $0.name.lowercased().contains("pro") }
-        let opus = allLimits.first { $0.name.lowercased().contains("opus") }
-        guard let p = pro, let o = opus else { return false }
-        return p.percentUsed >= 1.0 && o.percentUsed >= 1.0
+        let pro = allLimits.first { $0.name == "Gemini Pro" }
+        let cloud = allLimits.first { $0.name == "Cloud" }
+        guard let p = pro, let c = cloud else { return false }
+        return p.percentUsed >= 1.0 && c.percentUsed >= 1.0
     }
 
     /// Combined: should the card be red?
@@ -43,7 +42,7 @@ struct ProviderSection: View {
             return allLimits.first { $0.windowType == .fiveHour && $0.percentUsed >= 1.0 }?.detail
         }
         if isAllPinnedExhausted {
-            return (allLimits.first { $0.name.lowercased().contains("pro") && $0.percentUsed >= 1.0 })?.detail
+            return (allLimits.first { $0.name == "Cloud" && $0.percentUsed >= 1.0 })?.detail
         }
         return nil
     }
@@ -133,17 +132,32 @@ struct ProviderSection: View {
             .padding(.vertical, 3)
             .background(Capsule().fill(Color.red.opacity(0.12)))
         } else if provider == .antigravity {
-            // Show two key model limits: Gemini Pro + Claude Opus
-            let proLimit = allLimits.first { $0.name.lowercased().contains("3.1 pro") && $0.name.lowercased().contains("high") }
-                ?? allLimits.first { $0.name.lowercased().contains("pro") }
-            let opusLimit = allLimits.first { $0.name.lowercased().contains("opus") }
+            // Show two key bucket limits: Gemini Pro + Cloud
+            let proLimit = allLimits.first { $0.name == "Gemini Pro" }
+            let cloudLimit = allLimits.first { $0.name == "Cloud" }
 
             HStack(spacing: 4) {
                 if let pro = proLimit {
                     miniLimitBadge(label: "Pro", limit: pro)
                 }
-                if let opus = opusLimit {
-                    miniLimitBadge(label: "Opus", limit: opus)
+                if let cloud = cloudLimit {
+                    miniLimitBadge(label: "Cloud", limit: cloud)
+                }
+            }
+        } else if provider == .geminiCLI {
+            // Show Pro and Flash usage from live API data
+            let proLimit = allLimits.first { $0.name == "Pro" }
+            let flashLimit = allLimits.first { $0.name == "Flash" }
+
+            HStack(spacing: 4) {
+                if let pro = proLimit {
+                    miniLimitBadge(label: "Pro", limit: pro)
+                }
+                if let flash = flashLimit {
+                    miniLimitBadge(label: "Flash", limit: flash)
+                }
+                if proLimit == nil && flashLimit == nil, let first = allLimits.first {
+                    percentBadge(remaining: Int(first.percentRemaining * 100), color: first.limitColor)
                 }
             }
         } else if let fiveH = fiveHourLimit {

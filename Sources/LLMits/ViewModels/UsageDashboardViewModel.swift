@@ -22,6 +22,7 @@ class UsageDashboardViewModel: ObservableObject {
         case .anthropic: return AnthropicService()
         case .openai: return OpenAIService()
         case .antigravity: return AntigravityService(cachedServers: antigravityServers)
+        case .geminiCLI: return GeminiCLIService()
         case .cursor: return CursorService()
         }
     }

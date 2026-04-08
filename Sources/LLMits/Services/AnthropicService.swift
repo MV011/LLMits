@@ -4,6 +4,11 @@ import Security
 /// Fetches Claude usage via the Anthropic OAuth usage API.
 /// Reads credentials from macOS Keychain (Claude Code CLI) or ~/.claude/.credentials.json.
 ///
+/// Token strategy:
+/// 1. Read Keychain/file ONCE per app lifecycle, cache in memory
+/// 2. On 401, retry once with a fresh Keychain read
+/// 3. On 429, use exponential backoff via RateLimiter
+///
 /// NOTE: We do NOT refresh OAuth tokens ourselves. Claude Code CLI manages
 /// its own token lifecycle. We just re-read from Keychain when expired.
 struct AnthropicService: UsageService {
@@ -19,7 +24,7 @@ struct AnthropicService: UsageService {
             throw ServiceError.httpError(429)
         }
 
-        let accessToken = try resolveAccessToken(manualToken: token)
+        let accessToken = try await TokenResolver.shared.resolve(manualToken: token)
         let (data, httpResponse) = try await makeRequest(accessToken: accessToken)
 
         switch httpResponse.statusCode {
@@ -27,14 +32,28 @@ struct AnthropicService: UsageService {
             RateLimiter.shared.clear(Self.providerKey)
             return try parseUsageResponse(data)
         case 401:
-            // Token expired — clear cache, Claude Code CLI will refresh it
-            debugLog("[Anthropic] got 401, clearing cache (CLI will refresh token)")
-            TokenCache.shared.remove(Self.providerKey)
-            TokenCache.shared.remove("\(Self.providerKey)_creds")
-            throw ServiceError.httpError(401)
+            // Token might be stale — retry ONCE with a fresh Keychain read
+            debugLog("[Anthropic] got 401, retrying with fresh credentials")
+            await TokenResolver.shared.invalidateCache()
+
+            let freshToken = try await TokenResolver.shared.resolve(manualToken: token)
+            let (retryData, retryResponse) = try await makeRequest(accessToken: freshToken)
+
+            if retryResponse.statusCode == 200 {
+                RateLimiter.shared.clear(Self.providerKey)
+                return try parseUsageResponse(retryData)
+            }
+
+            // Still failing — clear everything and report
+            debugLog("[Anthropic] retry also failed with \(retryResponse.statusCode)")
+            await TokenResolver.shared.invalidateCache()
+            throw ServiceError.httpError(retryResponse.statusCode)
         case 429:
-            debugLog("[Anthropic] got 429, backing off for 120s")
-            RateLimiter.shared.recordLimit(Self.providerKey, backoffSeconds: 120)
+            // Parse Retry-After header if present
+            let retryAfterStr = httpResponse.value(forHTTPHeaderField: "Retry-After")
+            let retryAfter: TimeInterval? = retryAfterStr.flatMap { Double($0) }
+            debugLog("[Anthropic] got 429, recording rate limit (Retry-After: \(retryAfterStr ?? "none"))")
+            RateLimiter.shared.recordLimit(Self.providerKey, retryAfter: retryAfter)
             throw ServiceError.httpError(429)
         default:
             throw ServiceError.httpError(httpResponse.statusCode)
@@ -55,111 +74,6 @@ struct AnthropicService: UsageService {
             throw ServiceError.invalidResponse
         }
         return (data, httpResponse)
-    }
-
-    // MARK: - Token Resolution
-
-    private struct OAuthCredentials {
-        let accessToken: String
-        let expiresAt: Double  // epoch milliseconds
-    }
-
-    private func resolveAccessToken(manualToken: String) throws -> String {
-        if manualToken != "mock-token" && !manualToken.isEmpty {
-            return manualToken
-        }
-
-        // Check in-memory cache first (avoids Keychain prompts)
-        if let cached: OAuthCredentials = TokenCache.shared.getObject("\(Self.providerKey)_creds") {
-            let nowMs = Date().timeIntervalSince1970 * 1000
-            if cached.expiresAt > nowMs + 60_000 {
-                return cached.accessToken
-            }
-            // Token expired — clear cache and re-read from Keychain
-            // Claude Code CLI handles its own token refresh
-            debugLog("[Anthropic] cached token expired, will re-read from Keychain")
-            TokenCache.shared.remove("\(Self.providerKey)_creds")
-            TokenCache.shared.remove(Self.providerKey)
-        }
-
-        // Read fresh credentials from Keychain/file
-        guard let creds = Self.loadCredentials() else {
-            throw ServiceError.noCredentials("Install Claude Code CLI and run 'claude' to login, or paste an OAuth token manually.")
-        }
-
-        // Cache in memory for subsequent calls
-        TokenCache.shared.setObject("\(Self.providerKey)_creds", value: OAuthCredentials(
-            accessToken: creds.accessToken,
-            expiresAt: creds.expiresAt
-        ))
-
-        let nowMs = Date().timeIntervalSince1970 * 1000
-        if creds.expiresAt > nowMs + 60_000 {
-            TokenCache.shared.set(Self.providerKey, value: creds.accessToken)
-            return creds.accessToken
-        }
-
-        // Token from Keychain is already expired — try it anyway
-        // (Claude Code CLI may not have refreshed yet)
-        debugLog("[Anthropic] token from Keychain already expired, using anyway")
-        return creds.accessToken
-    }
-
-    // MARK: - Credentials Loading
-
-    private struct FullCredentials {
-        let accessToken: String
-        let expiresAt: Double
-    }
-
-    private static func loadCredentials() -> FullCredentials? {
-        // Try Keychain first
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-
-        var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-
-        if status == errSecSuccess, let data = result as? Data,
-           let jsonStr = String(data: data, encoding: .utf8),
-           let creds = parseCredentials(jsonStr) {
-            return creds
-        }
-
-        // Try credentials files
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        for path in [
-            home.appendingPathComponent(".claude/.credentials.json"),
-            home.appendingPathComponent(".claude/credentials.json"),
-        ] {
-            if let data = try? Data(contentsOf: path),
-               let jsonStr = String(data: data, encoding: .utf8),
-               let creds = parseCredentials(jsonStr) {
-                return creds
-            }
-        }
-
-        return nil
-    }
-
-    private static func parseCredentials(_ json: String) -> FullCredentials? {
-        guard let data = json.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return nil
-        }
-
-        let source = (obj["claudeAiOauth"] as? [String: Any]) ?? obj
-
-        guard let access = source["accessToken"] as? String ?? source["access_token"] as? String else {
-            return nil
-        }
-
-        let expires = source["expiresAt"] as? Double ?? 0
-        return FullCredentials(accessToken: access, expiresAt: expires)
     }
 
     // MARK: - Response Parsing
@@ -241,5 +155,150 @@ struct AnthropicService: UsageService {
         }
 
         return nil
+    }
+}
+
+// MARK: - Token Resolution Actor
+
+/// Serialized token resolver — ensures only ONE Keychain read happens at a time,
+/// even when multiple tasks are fetching usage concurrently.
+/// Caches credentials for the app's lifetime; only re-reads on explicit invalidation (e.g., after 401).
+actor TokenResolver {
+    static let shared = TokenResolver()
+
+    private struct CachedCredentials {
+        let accessToken: String
+        let expiresAt: Double  // epoch milliseconds
+        let readAt: Date       // when we cached this
+    }
+
+    private var cached: CachedCredentials?
+    /// Minimum interval between Keychain reads (prevent hammering on repeated 401s)
+    private let minReadInterval: TimeInterval = 5 // seconds
+    private var lastReadTime: Date?
+
+    private init() {}
+
+    /// Resolve the access token. Uses cache if valid, otherwise reads from Keychain/file.
+    func resolve(manualToken: String) throws -> String {
+        // Manual token passthrough
+        if manualToken != "mock-token" && manualToken != "mock" && !manualToken.isEmpty {
+            return manualToken
+        }
+
+        // Check memory cache first — avoids Keychain prompts entirely
+        if let c = cached {
+            let nowMs = Date().timeIntervalSince1970 * 1000
+            if c.expiresAt > nowMs + 60_000 {
+                return c.accessToken
+            }
+            // Token expired in cache — but don't re-read if we just did
+            debugLog("[TokenResolver] cached token expired, will re-read")
+        }
+
+        return try readFreshCredentials()
+    }
+
+    /// Clear the cache, forcing a fresh Keychain/file read on next resolve().
+    func invalidateCache() {
+        debugLog("[TokenResolver] cache invalidated")
+        cached = nil
+    }
+
+    /// Read fresh credentials from Keychain (primary) or credentials files (fallback).
+    /// Throttled to prevent hammering the Keychain on repeated failures.
+    private func readFreshCredentials() throws -> String {
+        // Throttle: don't re-read Keychain more than once per `minReadInterval`
+        if let lastRead = lastReadTime,
+           Date().timeIntervalSince(lastRead) < minReadInterval,
+           let c = cached {
+            debugLog("[TokenResolver] throttled, returning stale cached token")
+            return c.accessToken
+        }
+
+        debugLog("[TokenResolver] reading fresh credentials from Keychain/file")
+        guard let creds = Self.loadCredentials() else {
+            throw ServiceError.noCredentials("Install Claude Code CLI and run 'claude' to login, or paste an OAuth token manually.")
+        }
+
+        cached = CachedCredentials(
+            accessToken: creds.accessToken,
+            expiresAt: creds.expiresAt,
+            readAt: Date()
+        )
+        lastReadTime = Date()
+
+        let nowMs = Date().timeIntervalSince1970 * 1000
+        if creds.expiresAt > nowMs + 60_000 {
+            debugLog("[TokenResolver] fresh token valid, expires in \(Int((creds.expiresAt - nowMs) / 1000))s")
+            return creds.accessToken
+        }
+
+        // Token already expired — use anyway (Claude CLI may not have refreshed yet)
+        debugLog("[TokenResolver] fresh token already expired, using anyway")
+        return creds.accessToken
+    }
+
+    // MARK: - Credentials Loading (static, no actor isolation needed)
+
+    private struct FullCredentials {
+        let accessToken: String
+        let expiresAt: Double
+    }
+
+    private static func loadCredentials() -> FullCredentials? {
+        // Try Keychain first
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "Claude Code-credentials",
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+
+        if status == errSecSuccess, let data = result as? Data,
+           let jsonStr = String(data: data, encoding: .utf8),
+           let creds = parseCredentials(jsonStr) {
+            debugLog("[TokenResolver] loaded credentials from Keychain")
+            return creds
+        }
+
+        if status != errSecSuccess && status != errSecItemNotFound {
+            debugLog("[TokenResolver] Keychain error: \(status)")
+        }
+
+        // Try credentials files as fallback
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        for path in [
+            home.appendingPathComponent(".claude/.credentials.json"),
+            home.appendingPathComponent(".claude/credentials.json"),
+        ] {
+            if let data = try? Data(contentsOf: path),
+               let jsonStr = String(data: data, encoding: .utf8),
+               let creds = parseCredentials(jsonStr) {
+                debugLog("[TokenResolver] loaded credentials from \(path.lastPathComponent)")
+                return creds
+            }
+        }
+
+        return nil
+    }
+
+    private static func parseCredentials(_ json: String) -> FullCredentials? {
+        guard let data = json.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+
+        let source = (obj["claudeAiOauth"] as? [String: Any]) ?? obj
+
+        guard let access = source["accessToken"] as? String ?? source["access_token"] as? String else {
+            return nil
+        }
+
+        let expires = source["expiresAt"] as? Double ?? 0
+        return FullCredentials(accessToken: access, expiresAt: expires)
     }
 }

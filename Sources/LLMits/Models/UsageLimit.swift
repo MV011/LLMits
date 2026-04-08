@@ -22,6 +22,7 @@ struct UsageLimit: Identifiable {
         case fiveHour = "5-hour"
         case weekly = "Weekly"
         case daily = "Daily"
+        case perDay = "Per-day"
         case monthly = "Monthly"
         case unknown = ""
     }

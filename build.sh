@@ -42,6 +42,14 @@ if [ -d ".build/$CONFIG/LLMits_LLMits.bundle" ]; then
     cp -R ".build/$CONFIG/LLMits_LLMits.bundle" "$APP_DIR/Contents/Resources/"
 fi
 
+# Code-sign with entitlements (seals Info.plist + binary together)
+# This gives macOS a stable identity for Keychain "Always Allow" decisions.
+echo "🔏 Code-signing $APP_DIR..."
+codesign --force --sign - \
+    --entitlements "LLMits.entitlements" \
+    --identifier "com.mv011.llmits" \
+    "$APP_DIR"
+
 echo "✅ Built $APP_DIR"
 
 if $INSTALL; then

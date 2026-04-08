@@ -60,6 +60,11 @@ func discoverAntigravityServers() -> [AntigravityServerInfo] {
 }
 
 /// Fetches Antigravity quota by probing the local language server process.
+/// Groups the 5-6 individual models into 3 buckets:
+///   1. Gemini Pro — Gemini 3.1 Pro (High) + Gemini 3.1 Pro (Low)
+///   2. Gemini Flash — Gemini 3 Flash
+///   3. Cloud — Claude Opus, Claude Sonnet, GPT-OSS (shared quota)
+/// Also surfaces AI credit balances.
 struct AntigravityService: UsageService {
     var cachedServers: [AntigravityServerInfo] = []
 
@@ -68,7 +73,7 @@ struct AntigravityService: UsageService {
 
         for (i, server) in cachedServers.enumerated() {
             guard let ep = server.extensionPort else { continue }
-            let portsToTry = [ep + 1, ep + 2, ep, ep + 3]
+            let portsToTry = [ep + 1, ep + 2, ep, ep + 3, ep + 8, ep + 9, ep + 10]
 
             for port in portsToTry {
                 debugLog("[Antigravity] trying server[\(i)] port \(port)...")
@@ -139,49 +144,173 @@ struct AntigravityService: UsageService {
         let cascadeData = userStatus["cascadeModelConfigData"] as? [String: Any] ?? [:]
         let configs = cascadeData["clientModelConfigs"] as? [[String: Any]] ?? []
 
-        var groups: [UsageGroup] = []
+        // 1. Collect all models with quota info
+        struct ModelQuota {
+            let label: String
+            let remainingFraction: Double
+            let resetTime: String?
+        }
 
+        var allModels: [ModelQuota] = []
         for config in configs {
-            guard let quotaInfo = config["quotaInfo"] as? [String: Any],
-                  let remaining = quotaInfo["remainingFraction"] as? Double ?? quotaInfo["remaining_fraction"] as? Double else {
+            guard let quotaInfo = config["quotaInfo"] as? [String: Any] else {
                 continue
             }
-
+            // Handle both Double (0.2) and Int (1) JSON values
+            let remaining: Double
+            if let d = quotaInfo["remainingFraction"] as? Double ?? quotaInfo["remaining_fraction"] as? Double {
+                remaining = d
+            } else if let i = quotaInfo["remainingFraction"] as? Int ?? quotaInfo["remaining_fraction"] as? Int {
+                remaining = Double(i)
+            } else {
+                continue
+            }
             let label = config["label"] as? String ?? config["modelLabel"] as? String ?? "Unknown"
             let resetStr = quotaInfo["resetTime"] as? String ?? quotaInfo["reset_time"] as? String
-
-            // Use shared stale-reset detection
-            let (adjustedUsed, resetDetail) = TimeFormatter.adjustForStaleReset(
-                percentUsed: 1.0 - remaining,
-                resetDateString: resetStr,
-                windowSeconds: TimeFormatter.fiveHourSeconds
-            )
-
-            groups.append(UsageGroup(name: categorizeModel(label), limits: [
-                UsageLimit(name: label, percentUsed: adjustedUsed, detail: resetDetail, windowType: .fiveHour)
-            ]))
+            allModels.append(ModelQuota(label: label, remainingFraction: remaining, resetTime: resetStr))
         }
 
-        if groups.isEmpty {
+        // 2. Group into 3 buckets
+        //    Models within each bucket share the same remaining fraction and reset time
+        var geminiPro: [ModelQuota] = []
+        var geminiFlash: [ModelQuota] = []
+        var cloud: [ModelQuota] = []
+
+        for model in allModels {
+            let bucket = classifyIntoBucket(model.label)
+            switch bucket {
+            case .geminiPro: geminiPro.append(model)
+            case .geminiFlash: geminiFlash.append(model)
+            case .cloud: cloud.append(model)
+            }
+        }
+
+        // 3. Build limits from the 3 buckets
+        var limits: [UsageLimit] = []
+
+        if let rep = geminiPro.first {
+            limits.append(buildBucketLimit(
+                name: "Gemini Pro",
+                models: geminiPro.map(\.label),
+                remainingFraction: rep.remainingFraction,
+                resetTime: rep.resetTime
+            ))
+        }
+
+        if let rep = geminiFlash.first {
+            limits.append(buildBucketLimit(
+                name: "Gemini Flash",
+                models: geminiFlash.map(\.label),
+                remainingFraction: rep.remainingFraction,
+                resetTime: rep.resetTime
+            ))
+        }
+
+        if let rep = cloud.first {
+            limits.append(buildBucketLimit(
+                name: "Cloud",
+                models: cloud.map(\.label),
+                remainingFraction: rep.remainingFraction,
+                resetTime: rep.resetTime
+            ))
+        }
+
+        // 4. Add credits info
+        let creditLimits = parseCredits(userStatus)
+        limits.append(contentsOf: creditLimits)
+
+        if limits.isEmpty {
             let email = userStatus["email"] as? String ?? "Connected"
-            groups.append(UsageGroup(name: "Antigravity", limits: [
+            return [UsageGroup(name: "Antigravity", limits: [
                 UsageLimit(name: email, percentUsed: 0, detail: "No quota data", windowType: .unknown)
-            ]))
+            ])]
         }
 
-        return groups
+        return [UsageGroup(name: "Antigravity", limits: limits)]
     }
 
-    private func categorizeModel(_ label: String) -> String {
+    // MARK: - Bucketing
+
+    private enum Bucket {
+        case geminiPro, geminiFlash, cloud
+    }
+
+    private func classifyIntoBucket(_ label: String) -> Bucket {
         let lower = label.lowercased()
-        if lower.contains("opus") { return "Claude Opus" }
-        if lower.contains("sonnet") { return "Claude Sonnet" }
-        if lower.contains("claude") { return "Claude" }
-        if lower.contains("3.1 pro") { return "Gemini 3.1 Pro" }
-        if lower.contains("pro") { return "Gemini Pro" }
-        if lower.contains("flash") { return "Gemini Flash" }
-        if lower.contains("gpt") { return "GPT" }
-        return label
+        // Gemini Pro variants (High, Low, etc.)
+        if lower.contains("gemini") && lower.contains("pro") {
+            return .geminiPro
+        }
+        // Gemini Flash
+        if lower.contains("gemini") && lower.contains("flash") {
+            return .geminiFlash
+        }
+        // Everything else: Claude, GPT-OSS, etc.
+        return .cloud
+    }
+
+    private func buildBucketLimit(
+        name: String,
+        models: [String],
+        remainingFraction: Double,
+        resetTime: String?
+    ) -> UsageLimit {
+        let (adjustedUsed, resetDetail) = TimeFormatter.adjustForStaleReset(
+            percentUsed: 1.0 - remainingFraction,
+            resetDateString: resetTime,
+            windowSeconds: TimeFormatter.fiveHourSeconds
+        )
+
+        // Build models detail
+        let modelsStr = models.joined(separator: ", ")
+        var detail = modelsStr
+        if let rd = resetDetail, !rd.isEmpty {
+            detail = "\(modelsStr) · \(rd)"
+        }
+
+        return UsageLimit(
+            name: name,
+            percentUsed: adjustedUsed,
+            detail: detail,
+            windowType: .fiveHour
+        )
+    }
+
+    // MARK: - Credits
+
+    private func parseCredits(_ userStatus: [String: Any]) -> [UsageLimit] {
+        var credits: [UsageLimit] = []
+
+        // Google One AI credits (from userTier.availableCredits)
+        if let userTier = userStatus["userTier"] as? [String: Any],
+           let availableCredits = userTier["availableCredits"] as? [[String: Any]] {
+            for credit in availableCredits {
+                if let creditType = credit["creditType"] as? String,
+                   let amountStr = credit["creditAmount"] as? String,
+                   let amount = Int(amountStr) {
+                    let name = creditType
+                        .replacingOccurrences(of: "_", with: " ")
+                        .capitalized
+                        .replacingOccurrences(of: "Google One Ai", with: "Google One AI")
+                    credits.append(UsageLimit(
+                        name: name,
+                        percentUsed: 0, // No total known; display as info-only
+                        detail: formatCredits(amount) + " remaining",
+                        windowType: .unknown
+                    ))
+                }
+            }
+        }
+
+        return credits
+    }
+
+    private func formatCredits(_ amount: Int) -> String {
+        if amount >= 1000 {
+            let k = Double(amount) / 1000.0
+            return k.truncatingRemainder(dividingBy: 1) == 0 ? "\(Int(k))K" : String(format: "%.1fK", k)
+        }
+        return "\(amount)"
     }
 
     // MARK: - TLS (localhost self-signed cert)
