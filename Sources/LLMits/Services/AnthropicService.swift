@@ -31,9 +31,9 @@ struct AnthropicService: UsageService {
         case 200:
             RateLimiter.shared.clear(Self.providerKey)
             return try parseUsageResponse(data)
-        case 401:
+        case 401, 403:
             // Token might be stale — retry ONCE with a fresh Keychain read
-            debugLog("[Anthropic] got 401, retrying with fresh credentials")
+            debugLog("[Anthropic] got \(httpResponse.statusCode), retrying with fresh credentials")
             await TokenResolver.shared.invalidateCache()
 
             let freshToken = try await TokenResolver.shared.resolve(manualToken: token)
@@ -47,7 +47,9 @@ struct AnthropicService: UsageService {
             // Still failing — clear everything and report
             debugLog("[Anthropic] retry also failed with \(retryResponse.statusCode)")
             await TokenResolver.shared.invalidateCache()
-            throw ServiceError.httpError(retryResponse.statusCode)
+            throw ServiceError.noCredentials(
+                "Claude credentials expired. Open Claude and run any command to refresh, then retry."
+            )
         case 429:
             // Parse Retry-After header if present
             let retryAfterStr = httpResponse.value(forHTTPHeaderField: "Retry-After")

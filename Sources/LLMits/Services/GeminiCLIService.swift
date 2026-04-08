@@ -26,29 +26,51 @@ struct GeminiCLIService: UsageService {
 
     func fetchUsage(token: String) async throws -> [UsageGroup] {
         if RateLimiter.shared.isLimited(Self.providerKey) {
+            let remaining = RateLimiter.shared.remainingSeconds(Self.providerKey)
+            debugLog("[GeminiCLI] rate limited for \(remaining)s more")
             throw ServiceError.httpError(429)
         }
 
         // 1. Read OAuth creds
         let creds = try readOAuthCreds()
-        let accessToken = try await resolveAccessToken(creds)
+        var accessToken = try await resolveAccessToken(creds)
 
-        // 2. Get project ID and tier via loadCodeAssist
+        do {
+            let result = try await fetchWithToken(accessToken, creds: creds)
+            RateLimiter.shared.clear(Self.providerKey)
+            return result
+        } catch ServiceError.httpError(let code) where code == 401 || code == 403 {
+            // Token rejected — force-refresh and retry once
+            debugLog("[GeminiCLI] got \(code), force-refreshing token and retrying")
+            guard let refreshToken = creds.refreshToken else {
+                throw ServiceError.noCredentials(
+                    "Gemini token expired. Run 'gemini' to refresh credentials."
+                )
+            }
+            do {
+                accessToken = try await refreshAndPersist(refreshToken: refreshToken)
+            } catch {
+                debugLog("[GeminiCLI] token refresh failed: \(error)")
+                throw ServiceError.noCredentials(
+                    "Gemini token expired and refresh failed. Run 'gemini' to re-authenticate."
+                )
+            }
+            let result = try await fetchWithToken(accessToken, creds: creds)
+            RateLimiter.shared.clear(Self.providerKey)
+            return result
+        }
+    }
+
+    /// Core fetch logic — separated so we can retry with a fresh token.
+    private func fetchWithToken(_ accessToken: String, creds: OAuthCreds) async throws -> [UsageGroup] {
         let projectInfo = try await loadCodeAssist(accessToken: accessToken)
-
-        // 3. Fetch live quota from the API
         let quotaResponse = try await retrieveUserQuota(accessToken: accessToken, projectId: projectInfo.projectId)
-
-        // 4. Build usage groups from the response
-        let groups = buildUsageGroups(
+        return buildUsageGroups(
             buckets: quotaResponse.buckets,
             tier: projectInfo.tier,
             tierName: projectInfo.tierName,
             email: readAccountEmail()
         )
-
-        RateLimiter.shared.clear(Self.providerKey)
-        return groups
     }
 
     // MARK: - OAuth
@@ -120,7 +142,9 @@ struct GeminiCLIService: UsageService {
 
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-            throw ServiceError.httpError((response as? HTTPURLResponse)?.statusCode ?? 0)
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            debugLog("[GeminiCLI] OAuth refresh failed with HTTP \(code)")
+            throw ServiceError.httpError(code)
         }
 
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -128,7 +152,74 @@ struct GeminiCLIService: UsageService {
             throw ServiceError.parseError("Failed to parse refresh token response")
         }
 
+        debugLog("[GeminiCLI] token refreshed successfully")
         return newToken
+    }
+
+    /// Refresh the access token and write it back to ~/.gemini/oauth_creds.json
+    /// so other tools (and future app launches) pick up the fresh token.
+    private func refreshAndPersist(refreshToken: String) async throws -> String {
+        let url = URL(string: "https://oauth2.googleapis.com/token")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 10
+
+        let body = [
+            "grant_type=refresh_token",
+            "refresh_token=\(refreshToken.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? refreshToken)",
+            "client_id=\(Self.geminiCLIClientID)"
+        ].joined(separator: "&")
+        request.httpBody = body.data(using: .utf8)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            debugLog("[GeminiCLI] OAuth refresh-and-persist failed with HTTP \(code)")
+            throw ServiceError.httpError(code)
+        }
+
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let newToken = json["access_token"] as? String else {
+            throw ServiceError.parseError("Failed to parse refresh token response")
+        }
+
+        // Persist the refreshed token to disk
+        let expiresIn = json["expires_in"] as? Double ?? 3600
+        let newExpiryMs = (Date().timeIntervalSince1970 + expiresIn) * 1000
+        persistRefreshedToken(accessToken: newToken, expiryMs: newExpiryMs)
+
+        debugLog("[GeminiCLI] token refreshed and persisted (expires in \(Int(expiresIn))s)")
+        return newToken
+    }
+
+    /// Update ~/.gemini/oauth_creds.json with a new access token and expiry,
+    /// preserving all other fields (refresh_token, scope, etc.).
+    private func persistRefreshedToken(accessToken: String, expiryMs: Double) {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let credsURL = home.appendingPathComponent(".gemini/oauth_creds.json")
+
+        // Read existing file to preserve other fields
+        guard let existingData = try? Data(contentsOf: credsURL),
+              var json = try? JSONSerialization.jsonObject(with: existingData) as? [String: Any] else {
+            debugLog("[GeminiCLI] could not read existing creds file for update")
+            return
+        }
+
+        json["access_token"] = accessToken
+        json["expiry_date"] = expiryMs
+
+        guard let updatedData = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys]) else {
+            debugLog("[GeminiCLI] could not serialize updated creds")
+            return
+        }
+
+        do {
+            try updatedData.write(to: credsURL, options: .atomic)
+            debugLog("[GeminiCLI] persisted refreshed token to disk")
+        } catch {
+            debugLog("[GeminiCLI] failed to write refreshed token: \(error)")
+        }
     }
 
     // MARK: - Code Assist API

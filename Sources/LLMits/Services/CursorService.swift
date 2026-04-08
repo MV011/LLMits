@@ -14,12 +14,35 @@ struct CursorService: UsageService {
 
     func fetchUsage(token: String) async throws -> [UsageGroup] {
         if RateLimiter.shared.isLimited(Self.providerKey) {
+            let remaining = RateLimiter.shared.remainingSeconds(Self.providerKey)
+            debugLog("[Cursor] rate limited for \(remaining)s more")
             throw ServiceError.httpError(429)
         }
 
         let cookie = try resolveCookie(manualToken: token)
 
-        // Fetch usage data and stripe profile in parallel
+        do {
+            return try await fetchWithCookie(cookie)
+        } catch ServiceError.httpError(let code) where code == 401 || code == 403 {
+            // Session may have been refreshed by Cursor IDE — re-read the DB
+            debugLog("[Cursor] got \(code), re-reading DB for fresh tokens")
+            guard let freshCookie = Self.buildCookieFromDB() else {
+                throw ServiceError.noCredentials(
+                    "Cursor session expired. Open Cursor to refresh, then retry."
+                )
+            }
+            // Only retry if we actually got a different cookie
+            guard freshCookie != cookie else {
+                throw ServiceError.noCredentials(
+                    "Cursor session expired. Open Cursor to refresh, then retry."
+                )
+            }
+            return try await fetchWithCookie(freshCookie)
+        }
+    }
+
+    /// Core fetch logic — separated so we can retry with fresh credentials.
+    private func fetchWithCookie(_ cookie: String) async throws -> [UsageGroup] {
         async let periodData = fetchPeriodUsage(cookie: cookie)
         async let stripeData = fetchStripe(cookie: cookie)
 
@@ -171,8 +194,12 @@ struct CursorService: UsageService {
                 var redirectRequest = request
                 redirectRequest.url = redirectURL
                 let (rData, rResponse) = try await URLSession.shared.data(for: redirectRequest)
-                guard let rHttp = rResponse as? HTTPURLResponse, rHttp.statusCode == 200 else {
-                    throw ServiceError.httpError((rResponse as? HTTPURLResponse)?.statusCode ?? 0)
+                guard let rHttp = rResponse as? HTTPURLResponse else {
+                    throw ServiceError.invalidResponse
+                }
+                // Propagate auth errors from redirected request too
+                guard rHttp.statusCode == 200 else {
+                    throw ServiceError.httpError(rHttp.statusCode)
                 }
                 guard let json = try? JSONSerialization.jsonObject(with: rData) as? [String: Any] else {
                     throw ServiceError.parseError("Invalid JSON from Cursor (redirect)")
@@ -182,7 +209,9 @@ struct CursorService: UsageService {
         }
 
         if httpResponse.statusCode == 429 {
-            RateLimiter.shared.recordLimit(Self.providerKey)
+            let retryAfterStr = httpResponse.value(forHTTPHeaderField: "Retry-After")
+            let retryAfter: TimeInterval? = retryAfterStr.flatMap { Double($0) }
+            RateLimiter.shared.recordLimit(Self.providerKey, retryAfter: retryAfter)
             throw ServiceError.httpError(429)
         }
 
