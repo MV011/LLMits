@@ -3,8 +3,10 @@ import Foundation
 /// Fetches Cursor usage from cursor.com APIs.
 /// Authentication: reads JWT + user ID from Cursor's SQLite state.vscdb.
 ///
-/// Primary endpoint: POST /api/dashboard/get-current-period-usage
-/// Returns credit pool usage, billing cycle, and per-category percentages.
+/// Primary endpoints:
+///   - GET /api/usage-summary — individual + team usage breakdown
+///   - POST /api/dashboard/get-plan-info — plan name, price, included
+///   - GET /api/auth/stripe — membership type fallback
 struct CursorService: UsageService {
     private static let providerKey = "cursor"
 
@@ -311,7 +313,7 @@ struct CursorService: UsageService {
             }
 
             // Premium/API model bar — only if non-trivial and different from total
-            if apiPct > 0 && apiPct != (planUsage["totalPercentUsed"] as? Double ?? 0) {
+            if apiPct > 0 && abs(apiPct - (planUsage["totalPercentUsed"] as? Double ?? 0)) > 0.01 {
                 let apiMsg = summary["namedModelSelectedDisplayMessage"] as? String
                 let detail = apiMsg ?? String(format: "%.0f%% of included API usage", apiPct)
                 limits.append(UsageLimit(
@@ -391,13 +393,19 @@ struct CursorService: UsageService {
         return type.isEmpty ? "Cursor" : "Cursor \(type.capitalized)"
     }
 
+    /// Shared currency formatter — avoids re-allocation on every call.
+    private static let currencyFormatter: NumberFormatter = {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .currency
+        formatter.currencyCode = "USD"
+        return formatter
+    }()
+
     /// Format cent values as dollar strings.
     /// API values are in cents: 976970 → $9,769.70
     private func formatCents(_ cents: Int) -> String {
         let dollars = Double(cents) / 100.0
-        let formatter = NumberFormatter()
-        formatter.numberStyle = .currency
-        formatter.currencyCode = "USD"
+        let formatter = Self.currencyFormatter
         formatter.maximumFractionDigits = dollars == Double(Int(dollars)) ? 0 : 2
         return formatter.string(from: NSNumber(value: dollars)) ?? String(format: "$%.2f", dollars)
     }
