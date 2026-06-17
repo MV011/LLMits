@@ -132,22 +132,10 @@ struct ProviderSection: View {
             .padding(.vertical, 3)
             .background(Capsule().fill(Color.red.opacity(0.12)))
         } else if provider == .antigravity {
-            // Show two key bucket limits: Gemini Pro + Cloud
-            let proLimit = allLimits.first { $0.name == "Gemini Pro" }
+            // Show Pro + Flash usage (direct API) or Pro + Cloud (language server)
+            let proLimit = allLimits.first { $0.name == "Pro" || $0.name == "Gemini Pro" }
+            let flashLimit = allLimits.first { $0.name == "Flash" || $0.name == "Gemini Flash" }
             let cloudLimit = allLimits.first { $0.name == "Cloud" }
-
-            HStack(spacing: 4) {
-                if let pro = proLimit {
-                    miniLimitBadge(label: "Pro", limit: pro)
-                }
-                if let cloud = cloudLimit {
-                    miniLimitBadge(label: "Cloud", limit: cloud)
-                }
-            }
-        } else if provider == .geminiCLI {
-            // Show Pro and Flash usage from live API data
-            let proLimit = allLimits.first { $0.name == "Pro" }
-            let flashLimit = allLimits.first { $0.name == "Flash" }
 
             HStack(spacing: 4) {
                 if let pro = proLimit {
@@ -156,7 +144,10 @@ struct ProviderSection: View {
                 if let flash = flashLimit {
                     miniLimitBadge(label: "Flash", limit: flash)
                 }
-                if proLimit == nil && flashLimit == nil, let first = allLimits.first {
+                if let cloud = cloudLimit, flashLimit == nil {
+                    miniLimitBadge(label: "Cloud", limit: cloud)
+                }
+                if proLimit == nil && flashLimit == nil && cloudLimit == nil, let first = allLimits.first {
                     percentBadge(remaining: Int(first.percentRemaining * 100), color: first.limitColor)
                 }
             }

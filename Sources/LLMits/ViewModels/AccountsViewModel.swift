@@ -10,7 +10,7 @@ class AccountsViewModel: ObservableObject {
 
     private let accountsKey = "llmits.accounts"
     // Bump the version suffix when new auto-discoverable providers are added
-    private let hasRunAutoDiscoveryKey = "llmits.hasRunAutoDiscovery.v2"
+    private let hasRunAutoDiscoveryKey = "llmits.hasRunAutoDiscovery.v3"
 
     init() {
         loadAccounts()
@@ -25,9 +25,8 @@ class AccountsViewModel: ObservableObject {
         Task.detached { [weak self] in
             let hasClaude = Self.hasClaudeCodeCredentials()
             let hasCodex = Self.hasCodexCredentials()
-            let hasAntigravity = Self.isAntigravityRunning()
+            let hasAntigravity = Self.isAntigravityAvailable()
             let hasCursor = CursorService.readCursorJWT() != nil
-            let hasGeminiCLI = Self.hasGeminiCLICredentials()
 
             // Capture weak self before entering MainActor context
             guard let vm = self else { return }
@@ -40,9 +39,6 @@ class AccountsViewModel: ObservableObject {
                 }
                 if hasAntigravity && vm.accountsFor(provider: .antigravity).isEmpty {
                     vm.addAccount(provider: .antigravity, displayName: "Antigravity", token: "mock-token")
-                }
-                if hasGeminiCLI && vm.accountsFor(provider: .geminiCLI).isEmpty {
-                    vm.addAccount(provider: .geminiCLI, displayName: "Gemini CLI", token: "auto")
                 }
                 if hasCursor && vm.accountsFor(provider: .cursor).isEmpty {
                     vm.addAccount(provider: .cursor, displayName: "Cursor", token: "mock-token")
@@ -97,7 +93,17 @@ class AccountsViewModel: ObservableObject {
         )
     }
 
-    nonisolated private static func isAntigravityRunning() -> Bool {
+    /// Detect Antigravity availability: checks for running processes (desktop app or agy CLI)
+    /// AND the OAuth credentials file used by both surfaces.
+    nonisolated private static func isAntigravityAvailable() -> Bool {
+        // Check 1: OAuth creds file exists (works for both CLI and desktop)
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let hasOAuthCreds = FileManager.default.fileExists(
+            atPath: home.appendingPathComponent(".gemini/oauth_creds.json").path
+        )
+        if hasOAuthCreds { return true }
+
+        // Check 2: Antigravity desktop app or agy CLI is running
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/ps")
         process.arguments = ["-ax", "-o", "command="]
@@ -113,13 +119,15 @@ class AccountsViewModel: ObservableObject {
         process.waitUntilExit()
 
         let output = String(data: outputData, encoding: .utf8) ?? ""
-        return output.contains("language_server_macos") && output.contains("antigravity")
-    }
-
-    nonisolated private static func hasGeminiCLICredentials() -> Bool {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let credsPath = home.appendingPathComponent(".gemini/oauth_creds.json").path
-        return FileManager.default.fileExists(atPath: credsPath)
+        // Detect desktop app language server
+        if output.contains("language_server") && output.contains("antigravity") {
+            return true
+        }
+        // Detect agy CLI process
+        if output.contains("agy") {
+            return true
+        }
+        return false
     }
 
     // MARK: - Persistence
