@@ -5,10 +5,11 @@ struct AntigravityServerInfo: Sendable {
     let pid: String
     let csrfToken: String
     let extensionPort: Int?
+    let listeningPorts: [Int]
 }
 
-/// Discovers Antigravity desktop app language servers. MUST be called outside of
-/// Swift concurrency task groups — Process.waitUntilExit() deadlocks
+/// Discovers Antigravity desktop app and `agy` CLI language servers. MUST be called
+/// outside of Swift concurrency task groups — Process.waitUntilExit() deadlocks
 /// inside the cooperative thread pool executor.
 func discoverAntigravityServers() -> [AntigravityServerInfo] {
     let process = Process()
@@ -35,54 +36,96 @@ func discoverAntigravityServers() -> [AntigravityServerInfo] {
 
     for line in output.components(separatedBy: "\n") {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
-        guard trimmed.contains("language_server") && trimmed.contains("antigravity") else {
-            continue
-        }
+        guard !trimmed.isEmpty else { continue }
 
         let parts = trimmed.split(separator: " ", maxSplits: 1)
         guard let pid = parts.first else { continue }
+        let command = parts.count > 1 ? String(parts[1]) : trimmed
+
+        guard isAntigravityLanguageServer(command) || isAgyServerProcess(command) else {
+            continue
+        }
 
         var csrfToken = ""
-        if let r = trimmed.range(of: "--csrf_token ") {
-            csrfToken = String(trimmed[r.upperBound...].split(separator: " ").first ?? "")
+        if let r = command.range(of: "--csrf_token ") {
+            csrfToken = String(command[r.upperBound...].split(separator: " ").first ?? "")
         }
 
         var extPort: Int? = nil
-        if let r = trimmed.range(of: "--extension_server_port ") {
-            extPort = Int(trimmed[r.upperBound...].split(separator: " ").first ?? "")
+        if let r = command.range(of: "--extension_server_port ") {
+            extPort = Int(command[r.upperBound...].split(separator: " ").first ?? "")
         }
 
-        guard !csrfToken.isEmpty else { continue }
-        servers.append(AntigravityServerInfo(pid: String(pid), csrfToken: csrfToken, extensionPort: extPort))
+        let listeningPorts = discoverListeningPorts(pid: String(pid))
+        debugLog("[Antigravity] discovered pid=\(pid) csrf=\(csrfToken.isEmpty ? "none" : "set") ports=\(listeningPorts) extPort=\(extPort.map(String.init) ?? "nil")")
+
+        servers.append(AntigravityServerInfo(
+            pid: String(pid),
+            csrfToken: csrfToken,
+            extensionPort: extPort,
+            listeningPorts: listeningPorts
+        ))
     }
 
     return servers
 }
 
+private func isAntigravityLanguageServer(_ command: String) -> Bool {
+    let lower = command.lowercased()
+    guard lower.contains("language_server") else { return false }
+    return lower.contains("antigravity")
+        || lower.contains("antigravity-ide")
+        || lower.contains("/antigravity/")
+}
+
+private func isAgyServerProcess(_ command: String) -> Bool {
+    let parts = command.split(separator: " ", maxSplits: 1)
+    let basename = parts.first.map(String.init) ?? command
+    if basename.hasSuffix("/agy") || basename == "agy" { return true }
+    return command.contains("/agy") || command.contains(" agy ")
+}
+
+private func discoverListeningPorts(pid: String) -> [Int] {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+    process.arguments = ["-nP", "-iTCP", "-sTCP:LISTEN", "-a", "-p", pid]
+
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = Pipe()
+
+    guard (try? process.run()) != nil else { return [] }
+
+    let outputData = pipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+
+    let output = String(data: outputData, encoding: .utf8) ?? ""
+    var ports: [Int] = []
+
+    for line in output.components(separatedBy: "\n") {
+        // Example: agy 12345 user 8u IPv4 ... TCP 127.0.0.1:54321 (LISTEN)
+        guard let range = line.range(of: "127.0.0.1:") else { continue }
+        let after = line[range.upperBound...]
+        let portStr = after.prefix(while: { $0.isNumber })
+        if let port = Int(portStr) {
+            ports.append(port)
+        }
+    }
+
+    return Array(Set(ports)).sorted()
+}
+
 /// Fetches Antigravity usage via two strategies:
 ///
-/// 1. **Primary: Direct API** — Uses the cloudcode-pa.googleapis.com API with
-///    OAuth tokens from ~/.gemini/oauth_creds.json (shared by both the Antigravity
-///    CLI `agy` and the desktop app). This works regardless of which surface is running.
+/// 1. **Primary: Language Server** — `RetrieveUserQuotaSummary` on the Antigravity app
+///    or `agy` CLI local server (Gemini Models / Claude+GPT with Weekly + 5h limits).
+///    Falls back to `GetUserStatus` when the summary endpoint is unavailable.
 ///
-/// 2. **Fallback: Language Server** — Probes the Antigravity desktop app's local
-///    language server via GetUserStatus. Only used when OAuth creds are unavailable.
-///
-/// Groups models into 3 buckets: Gemini Pro, Gemini Flash, Flash Lite.
-/// Also surfaces AI credit balances when available.
+/// 2. **Fallback: Cloud API** — `retrieveUserQuotaSummary` or `fetchAvailableModels`
+///    with OAuth creds when no local server is reachable.
 struct AntigravityService: UsageService {
     private static let providerKey = "antigravity"
     private static let codeAssistEndpoint = "https://cloudcode-pa.googleapis.com/v1internal"
-
-    /// Known daily request limits per tier
-    private static let tierLimits: [String: Int] = [
-        "g1-ultra-tier": 2000,
-        "enterprise-tier": 2000,
-        "workspace-ai-ultra-tier": 2000,
-        "g1-pro-tier": 1500,
-        "standard-tier": 1500,
-        "free-tier": 1000,
-    ]
 
     var cachedServers: [AntigravityServerInfo] = []
 
@@ -93,16 +136,28 @@ struct AntigravityService: UsageService {
             throw ServiceError.httpError(429)
         }
 
-        // Strategy 1: Direct API via OAuth (works for both CLI and desktop app)
+        let servers = cachedServers.isEmpty ? discoverAntigravityServers() : cachedServers
+
+        // Strategy 1: Language server (Antigravity IDE / agy local quota surface)
+        if !servers.isEmpty {
+            do {
+                let result = try await fetchViaLanguageServer(servers: servers)
+                RateLimiter.shared.clear(Self.providerKey)
+                return result
+            } catch {
+                debugLog("[Antigravity] language server failed: \(error), trying cloud models API")
+            }
+        }
+
+        // Strategy 2: Cloud quota summary / models API
         if let oauthCreds = try? GoogleOAuthHelper.readOAuthCreds() {
             do {
                 var accessToken = try await GoogleOAuthHelper.resolveAccessToken(oauthCreds)
                 do {
-                    let result = try await fetchViaDirectAPI(accessToken: accessToken)
+                    let result = try await fetchViaCloudQuota(accessToken: accessToken)
                     RateLimiter.shared.clear(Self.providerKey)
                     return result
                 } catch ServiceError.httpError(let code) where code == 401 || code == 403 {
-                    // Token rejected — force-refresh and retry once
                     debugLog("[Antigravity] got \(code), force-refreshing token and retrying")
                     guard let refreshToken = oauthCreds.refreshToken else {
                         throw ServiceError.noCredentials(
@@ -117,239 +172,172 @@ struct AntigravityService: UsageService {
                             "Antigravity token expired and refresh failed. Run 'agy' to re-authenticate."
                         )
                     }
-                    let result = try await fetchViaDirectAPI(accessToken: accessToken)
+                    let result = try await fetchViaCloudQuota(accessToken: accessToken)
                     RateLimiter.shared.clear(Self.providerKey)
                     return result
                 }
             } catch {
-                debugLog("[Antigravity] direct API failed: \(error), trying language server fallback")
-                // Fall through to language server probe
+                debugLog("[Antigravity] cloud quota API failed: \(error)")
+                throw error
             }
         }
 
-        // Strategy 2: Language Server probe (desktop app only)
-        return try await fetchViaLanguageServer()
-    }
-
-    // MARK: - Strategy 1: Direct API
-
-    private struct ProjectInfo {
-        let projectId: String
-        let tier: String      // e.g. "g1-ultra-tier"
-        let tierName: String  // e.g. "Gemini Code Assist in Google One AI Ultra"
-    }
-
-    private func fetchViaDirectAPI(accessToken: String) async throws -> [UsageGroup] {
-        let projectInfo = try await loadCodeAssist(accessToken: accessToken)
-        let quotaResponse = try await retrieveUserQuota(accessToken: accessToken, projectId: projectInfo.projectId)
-        return buildUsageGroups(
-            buckets: quotaResponse.buckets,
-            tier: projectInfo.tier,
-            tierName: projectInfo.tierName,
-            email: GoogleOAuthHelper.readAccountEmail()
-        )
-    }
-
-    private func loadCodeAssist(accessToken: String) async throws -> ProjectInfo {
-        let url = URL(string: "\(Self.codeAssistEndpoint):loadCodeAssist")!
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 10
-        request.httpBody = "{}".data(using: .utf8)
-
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw ServiceError.invalidResponse
-        }
-
-        if httpResponse.statusCode == 429 {
-            let retryAfterStr = httpResponse.value(forHTTPHeaderField: "Retry-After")
-            let retryAfter: TimeInterval? = retryAfterStr.flatMap { Double($0) }
-            RateLimiter.shared.recordLimit(Self.providerKey, retryAfter: retryAfter)
-            throw ServiceError.httpError(429)
-        }
-
-        guard httpResponse.statusCode == 200 else {
-            throw ServiceError.httpError(httpResponse.statusCode)
-        }
-
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw ServiceError.parseError("Invalid JSON from loadCodeAssist")
-        }
-
-        guard let projectId = json["cloudaicompanionProject"] as? String else {
-            throw ServiceError.parseError("No project ID in loadCodeAssist response")
-        }
-
-        // Prefer paidTier (subscription) over currentTier (base)
-        let paidTier = json["paidTier"] as? [String: Any]
-        let currentTier = json["currentTier"] as? [String: Any]
-        let tier = (paidTier?["id"] as? String) ?? (currentTier?["id"] as? String) ?? "standard-tier"
-        let tierName = (paidTier?["name"] as? String) ?? (currentTier?["name"] as? String) ?? "Antigravity"
-
-        return ProjectInfo(projectId: projectId, tier: tier, tierName: tierName)
-    }
-
-    private struct QuotaBucket {
-        let modelId: String
-        let remainingFraction: Double
-        let resetTime: String?
-    }
-
-    private struct QuotaResponse {
-        let buckets: [QuotaBucket]
-    }
-
-    private func retrieveUserQuota(accessToken: String, projectId: String) async throws -> QuotaResponse {
-        let url = URL(string: "\(Self.codeAssistEndpoint):retrieveUserQuota")!
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 10
-        request.httpBody = try JSONSerialization.data(withJSONObject: ["project": projectId])
-
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw ServiceError.invalidResponse
-        }
-
-        if httpResponse.statusCode == 429 {
-            let retryAfterStr = httpResponse.value(forHTTPHeaderField: "Retry-After")
-            let retryAfter: TimeInterval? = retryAfterStr.flatMap { Double($0) }
-            RateLimiter.shared.recordLimit(Self.providerKey, retryAfter: retryAfter)
-            throw ServiceError.httpError(429)
-        }
-
-        guard httpResponse.statusCode == 200 else {
-            throw ServiceError.httpError(httpResponse.statusCode)
-        }
-
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let rawBuckets = json["buckets"] as? [[String: Any]] else {
-            throw ServiceError.parseError("Invalid JSON from retrieveUserQuota")
-        }
-
-        let buckets = rawBuckets.compactMap { bucket -> QuotaBucket? in
-            guard let modelId = bucket["modelId"] as? String else { return nil }
-            // Handle both Double (0.2) and Int (1) JSON values
-            let remainingFraction: Double
-            if let d = bucket["remainingFraction"] as? Double {
-                remainingFraction = d
-            } else if let i = bucket["remainingFraction"] as? Int {
-                remainingFraction = Double(i)
-            } else {
-                return nil
-            }
-            return QuotaBucket(
-                modelId: modelId,
-                remainingFraction: remainingFraction,
-                resetTime: bucket["resetTime"] as? String
+        if servers.isEmpty {
+            throw ServiceError.processNotFound(
+                "Antigravity is not running. Keep `agy` open or launch the desktop app, then refresh."
             )
         }
-
-        return QuotaResponse(buckets: buckets)
+        throw ServiceError.processNotFound("Antigravity is running but could not connect to quota API.")
     }
 
-    // MARK: - Build Usage Groups (from direct API)
+    // MARK: - Strategy 2: Cloud API
 
-    private enum ModelCategory: String, CaseIterable {
-        case pro, flash, lite
-        var displayName: String {
-            switch self {
-            case .pro: return "Pro"
-            case .flash: return "Flash"
-            case .lite: return "Flash Lite"
-            }
+    private func fetchViaCloudQuota(accessToken: String) async throws -> [UsageGroup] {
+        // Prefer the same quota-summary shape agy uses when available over OAuth.
+        do {
+            return try await fetchCloudQuotaSummary(accessToken: accessToken)
+        } catch {
+            debugLog("[Antigravity] cloud retrieveUserQuotaSummary failed: \(error), trying fetchAvailableModels")
         }
+        return try await fetchViaCloudModels(accessToken: accessToken)
     }
 
-    private func buildUsageGroups(
-        buckets: [QuotaBucket],
-        tier: String,
-        tierName: String,
-        email: String
-    ) -> [UsageGroup] {
-        // Determine daily limit from tier
-        let dailyLimit = Self.tierLimits[tier] ?? 1000
+    private func fetchCloudQuotaSummary(accessToken: String) async throws -> [UsageGroup] {
+        let endpoints = [
+            "\(Self.codeAssistEndpoint):retrieveUserQuotaSummary",
+            "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+        ]
 
-        // Group API buckets by our three categories
-        var bucketData: [ModelCategory: (remainingFraction: Double, resetTime: Date?, models: [String])] = [:]
+        var lastError: Error = ServiceError.invalidResponse
+        for endpoint in endpoints {
+            guard let url = URL(string: endpoint) else { continue }
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue("antigravity", forHTTPHeaderField: "User-Agent")
+            request.timeoutInterval = 10
+            request.httpBody = "{}".data(using: .utf8)
 
-        for bucket in buckets {
-            let category = classifyModel(bucket.modelId)
-            let resetDate = GoogleOAuthHelper.parseISO8601(bucket.resetTime ?? "")
-
-            if let existing = bucketData[category] {
-                var models = existing.models
-                models.append(bucket.modelId)
-                bucketData[category] = (existing.remainingFraction, existing.resetTime ?? resetDate, models)
-            } else {
-                bucketData[category] = (bucket.remainingFraction, resetDate, [bucket.modelId])
-            }
-        }
-
-        var limits: [UsageLimit] = []
-
-        for category in [ModelCategory.pro, .flash, .lite] {
-            let data = bucketData[category]
-            let remainingFraction = data?.remainingFraction ?? 1.0
-            let usedFraction = 1.0 - remainingFraction
-            let usedRequests = Int(round(usedFraction * Double(dailyLimit)))
-            let resetDate = data?.resetTime
-
-            var parts: [String] = []
-            parts.append("\(usedRequests) / \(dailyLimit) req")
-
-            if let reset = resetDate, reset > Date() {
-                let remaining = reset.timeIntervalSinceNow
-                if let formatted = TimeFormatter.formatRemaining(remaining) {
-                    parts.append("Resets in \(formatted)")
+            do {
+                let (data, response) = try await URLSession.shared.data(for: request)
+                guard let httpResponse = response as? HTTPURLResponse else {
+                    throw ServiceError.invalidResponse
                 }
+                guard httpResponse.statusCode == 200 else {
+                    throw ServiceError.httpError(httpResponse.statusCode)
+                }
+                return try parseQuotaSummaryResponse(data)
+            } catch {
+                debugLog("[Antigravity] cloud quota summary at \(endpoint) failed: \(error)")
+                lastError = error
+            }
+        }
+        throw lastError
+    }
+
+    private func fetchViaCloudModels(accessToken: String) async throws -> [UsageGroup] {
+        let endpoints = [
+            "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+            "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+        ]
+
+        var lastError: Error = ServiceError.invalidResponse
+
+        for endpoint in endpoints {
+            guard let url = URL(string: endpoint) else { continue }
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue("antigravity", forHTTPHeaderField: "User-Agent")
+            request.timeoutInterval = 10
+            request.httpBody = "{}".data(using: .utf8)
+
+            do {
+                let (data, response) = try await URLSession.shared.data(for: request)
+                guard let httpResponse = response as? HTTPURLResponse else {
+                    throw ServiceError.invalidResponse
+                }
+
+                if httpResponse.statusCode == 429 {
+                    let retryAfterStr = httpResponse.value(forHTTPHeaderField: "Retry-After")
+                    let retryAfter: TimeInterval? = retryAfterStr.flatMap { Double($0) }
+                    RateLimiter.shared.recordLimit(Self.providerKey, retryAfter: retryAfter)
+                    throw ServiceError.httpError(429)
+                }
+
+                guard httpResponse.statusCode == 200 else {
+                    throw ServiceError.httpError(httpResponse.statusCode)
+                }
+
+                return try parseCloudModelsResponse(data)
+            } catch {
+                debugLog("[Antigravity] fetchAvailableModels at \(endpoint) failed: \(error)")
+                lastError = error
+            }
+        }
+
+        throw lastError
+    }
+
+    private func parseCloudModelsResponse(_ data: Data) throws -> [UsageGroup] {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let models = json["models"] as? [String: Any] else {
+            throw ServiceError.parseError("Invalid JSON from fetchAvailableModels")
+        }
+
+        var allModels: [ModelQuotaEntry] = []
+        for (modelId, value) in models {
+            guard let model = value as? [String: Any] else { continue }
+            if model["isInternal"] as? Bool == true { continue }
+
+            let displayName = (model["displayName"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if displayName.isEmpty { continue }
+
+            let label = displayName
+            let lowerId = modelId.lowercased()
+            if lowerId.contains("chat_") || lowerId.contains("tab_") || lowerId.contains("autocomplete") {
+                continue
             }
 
-            limits.append(UsageLimit(
-                name: category.displayName,
-                percentUsed: usedFraction,
-                detail: parts.joined(separator: " · "),
-                windowType: .perDay
-            ))
+            guard let quotaInfo = model["quotaInfo"] as? [String: Any] else { continue }
+            let remaining: Double
+            if let d = quotaInfo["remainingFraction"] as? Double {
+                remaining = d
+            } else if let i = quotaInfo["remainingFraction"] as? Int {
+                remaining = Double(i)
+            } else {
+                continue
+            }
+
+            let resetStr = quotaInfo["resetTime"] as? String
+            allModels.append(ModelQuotaEntry(label: label, remainingFraction: remaining, resetTime: resetStr))
         }
 
-        // Use tier name as the group header (e.g. "Google One AI Ultra")
-        let shortTierName = tierName
-            .replacingOccurrences(of: "Gemini Code Assist in ", with: "")
-            .replacingOccurrences(of: "Gemini Code Assist", with: "Code Assist")
-
-        return [UsageGroup(name: shortTierName, limits: limits)]
+        return buildAntigravityUsageGroups(from: allModels)
     }
 
-    private func classifyModel(_ name: String) -> ModelCategory {
-        let lower = name.lowercased()
-        if lower.contains("flash-lite") || lower.contains("flash_lite") || lower.contains("lite") {
-            return .lite
-        }
-        if lower.contains("pro") {
-            return .pro
-        }
-        return .flash
-    }
+    // MARK: - Strategy 1: Language Server
 
-    // MARK: - Strategy 2: Language Server Fallback
+    private func fetchViaLanguageServer(servers: [AntigravityServerInfo]) async throws -> [UsageGroup] {
+        debugLog("[Antigravity] fetchViaLanguageServer with \(servers.count) servers")
 
-    private func fetchViaLanguageServer() async throws -> [UsageGroup] {
-        debugLog("[Antigravity] fetchViaLanguageServer with \(cachedServers.count) cached servers")
-
-        for (i, server) in cachedServers.enumerated() {
-            guard let ep = server.extensionPort else { continue }
-            let portsToTry = [ep + 1, ep + 2, ep, ep + 3, ep + 8, ep + 9, ep + 10]
+        for (i, server) in servers.enumerated() {
+            var portsToTry = server.listeningPorts
+            if let ep = server.extensionPort {
+                portsToTry.append(contentsOf: [ep + 1, ep + 2, ep, ep + 3, ep + 8, ep + 9, ep + 10])
+            }
+            portsToTry = Array(Set(portsToTry)).sorted()
 
             for port in portsToTry {
-                debugLog("[Antigravity] trying server[\(i)] port \(port)...")
+                debugLog("[Antigravity] trying server[\(i)] pid=\(server.pid) port \(port)...")
                 do {
-                    let groups = try await fetchQuotaWithTimeout(port: port, csrfToken: server.csrfToken, timeoutSeconds: 3)
+                    let groups = try await fetchQuotaWithTimeout(
+                        port: port,
+                        csrfToken: server.csrfToken,
+                        timeoutSeconds: 3
+                    )
                     debugLog("[Antigravity] SUCCESS on port \(port)")
                     return groups
                 } catch {
@@ -359,10 +347,68 @@ struct AntigravityService: UsageService {
             }
         }
 
-        if cachedServers.isEmpty {
-            throw ServiceError.processNotFound("Antigravity is not running. Launch it or install the CLI (agy) to see usage data.")
+        if servers.isEmpty {
+            throw ServiceError.processNotFound("Antigravity is not running. Launch it or run 'agy' to see usage data.")
         }
         throw ServiceError.processNotFound("Antigravity is running but could not connect to language server.")
+    }
+
+    private func buildAntigravityUsageGroups(from models: [ModelQuotaEntry]) -> [UsageGroup] {
+        enum LSBucket { case geminiPro, geminiFlash, cloud }
+
+        func classifyLSModel(_ label: String) -> LSBucket {
+            let lower = label.lowercased()
+            if lower.contains("gemini") && lower.contains("pro") { return .geminiPro }
+            if lower.contains("gemini") && lower.contains("flash") { return .geminiFlash }
+            return .cloud
+        }
+
+        var geminiPro: [ModelQuotaEntry] = []
+        var geminiFlash: [ModelQuotaEntry] = []
+        var cloud: [ModelQuotaEntry] = []
+
+        for model in models {
+            switch classifyLSModel(model.label) {
+            case .geminiPro: geminiPro.append(model)
+            case .geminiFlash: geminiFlash.append(model)
+            case .cloud: cloud.append(model)
+            }
+        }
+
+        var limits: [UsageLimit] = []
+
+        func buildLSLimit(name: String, models: [ModelQuotaEntry]) -> UsageLimit? {
+            guard let rep = models.first else { return nil }
+            let (adjustedUsed, resetDetail) = TimeFormatter.adjustForStaleReset(
+                percentUsed: 1.0 - rep.remainingFraction,
+                resetDateString: rep.resetTime,
+                windowSeconds: TimeFormatter.fiveHourSeconds
+            )
+            let modelsStr = models.map(\.label).joined(separator: ", ")
+            var detail = modelsStr
+            if let rd = resetDetail, !rd.isEmpty {
+                detail = "\(modelsStr) · \(rd)"
+            }
+            return UsageLimit(name: name, percentUsed: adjustedUsed, detail: detail, windowType: .fiveHour)
+        }
+
+        if let l = buildLSLimit(name: "Gemini Pro", models: geminiPro) { limits.append(l) }
+        if let l = buildLSLimit(name: "Gemini Flash", models: geminiFlash) { limits.append(l) }
+        if let l = buildLSLimit(name: "Cloud", models: cloud) { limits.append(l) }
+
+        if limits.isEmpty {
+            return [UsageGroup(name: "Antigravity", limits: [
+                UsageLimit(name: "Connected", percentUsed: 0, detail: "No quota data", windowType: .unknown)
+            ])]
+        }
+
+        return [UsageGroup(name: "Antigravity", limits: limits)]
+    }
+
+    private struct ModelQuotaEntry {
+        let label: String
+        let remainingFraction: Double
+        let resetTime: String?
     }
 
     // MARK: - Language Server Quota Fetch
@@ -383,28 +429,154 @@ struct AntigravityService: UsageService {
     }
 
     private func fetchQuota(port: Int, csrfToken: String) async throws -> [UsageGroup] {
-        let url = URL(string: "https://127.0.0.1:\(port)/exa.language_server_pb.LanguageServerService/GetUserStatus")!
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue(csrfToken, forHTTPHeaderField: "X-Codeium-Csrf-Token")
-        request.setValue("1", forHTTPHeaderField: "Connect-Protocol-Version")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: [
-            "metadata": ["ideName": "antigravity", "extensionName": "antigravity", "locale": "en"]
-        ])
-        request.timeoutInterval = 3
-
-        let (data, response) = try await Self._insecureSession.data(for: request)
-
-        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-            throw ServiceError.httpError((response as? HTTPURLResponse)?.statusCode ?? 0)
+        // Primary: same endpoint agy CLI uses (grouped Weekly + 5h limits).
+        do {
+            let data = try await postLocalLS(
+                port: port,
+                csrfToken: csrfToken,
+                method: "RetrieveUserQuotaSummary",
+                body: [:]
+            )
+            return try parseQuotaSummaryResponse(data)
+        } catch {
+            debugLog("[Antigravity] RetrieveUserQuotaSummary on port \(port) failed: \(error), trying GetUserStatus")
         }
 
+        let data = try await postLocalLS(
+            port: port,
+            csrfToken: csrfToken,
+            method: "GetUserStatus",
+            body: [
+                "metadata": ["ideName": "antigravity", "extensionName": "antigravity", "locale": "en"]
+            ]
+        )
         return try parseLanguageServerResponse(data)
     }
 
-    // MARK: - Language Server Response Parsing
+    private func postLocalLS(port: Int, csrfToken: String, method: String, body: [String: Any]) async throws -> Data {
+        let url = URL(string: "https://127.0.0.1:\(port)/exa.language_server_pb.LanguageServerService/\(method)")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        if !csrfToken.isEmpty {
+            request.setValue(csrfToken, forHTTPHeaderField: "X-Codeium-Csrf-Token")
+        }
+        request.setValue("1", forHTTPHeaderField: "Connect-Protocol-Version")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = body.isEmpty
+            ? "{}".data(using: .utf8)
+            : try JSONSerialization.data(withJSONObject: body)
+        request.timeoutInterval = 3
+
+        let (data, response) = try await Self._insecureSession.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+            throw ServiceError.httpError((response as? HTTPURLResponse)?.statusCode ?? 0)
+        }
+        return data
+    }
+
+    // MARK: - Quota Summary Parsing (agy CLI format)
+
+    private func parseQuotaSummaryResponse(_ data: Data) throws -> [UsageGroup] {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw ServiceError.parseError("Invalid quota summary JSON")
+        }
+
+        if let code = json["code"] as? Int, code != 0 {
+            let msg = json["message"] as? String ?? "Quota summary API error"
+            throw ServiceError.parseError(msg)
+        }
+
+        let payload = (json["response"] as? [String: Any])
+            ?? (json["summary"] as? [String: Any])
+            ?? json
+
+        guard let groups = payload["groups"] as? [[String: Any]], !groups.isEmpty else {
+            throw ServiceError.parseError("Missing quota groups in summary")
+        }
+
+        var usageGroups: [UsageGroup] = []
+        for group in groups {
+            let groupName = (group["displayName"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? "Quota"
+            guard let buckets = group["buckets"] as? [[String: Any]], !buckets.isEmpty else { continue }
+
+            var limits: [UsageLimit] = []
+            for bucket in buckets {
+                if let limit = parseQuotaSummaryBucket(bucket) {
+                    limits.append(limit)
+                }
+            }
+            if !limits.isEmpty {
+                usageGroups.append(UsageGroup(name: groupName, limits: limits))
+            }
+        }
+
+        guard !usageGroups.isEmpty else {
+            throw ServiceError.parseError("No usable quota buckets")
+        }
+        return usageGroups
+    }
+
+    private func parseQuotaSummaryBucket(_ bucket: [String: Any]) -> UsageLimit? {
+        let bucketId = (bucket["bucketId"] as? String) ?? ""
+        let displayName = (bucket["displayName"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? bucketId
+        guard !displayName.isEmpty else { return nil }
+        if bucket["disabled"] as? Bool == true { return nil }
+
+        let remainingFraction = resolveRemainingFraction(from: bucket)
+        guard let remaining = remainingFraction else { return nil }
+
+        let resetStr = bucket["resetTime"] as? String
+        let windowType = inferWindowType(bucketId: bucketId, displayName: displayName)
+        let windowSeconds = windowType == .weekly
+            ? TimeFormatter.weeklySeconds
+            : TimeFormatter.fiveHourSeconds
+
+        let (adjustedUsed, resetDetail) = TimeFormatter.adjustForStaleReset(
+            percentUsed: 1.0 - remaining,
+            resetDateString: resetStr,
+            windowSeconds: windowSeconds
+        )
+
+        var detail = bucket["description"] as? String
+        if let rd = resetDetail, !rd.isEmpty {
+            detail = detail.map { "\($0) · \(rd)" } ?? rd
+        }
+
+        return UsageLimit(
+            name: displayName,
+            percentUsed: adjustedUsed,
+            detail: detail,
+            windowType: windowType
+        )
+    }
+
+    private func resolveRemainingFraction(from bucket: [String: Any]) -> Double? {
+        if let rf = bucket["remainingFraction"] as? Double { return rf }
+        if let rf = bucket["remainingFraction"] as? Int { return Double(rf) }
+        guard let remaining = bucket["remaining"] as? [String: Any] else { return nil }
+        if let rf = remaining["remainingFraction"] as? Double { return rf }
+        if let rf = remaining["remainingFraction"] as? Int { return Double(rf) }
+        if let oneofCase = remaining["case"] as? String, oneofCase == "remainingFraction" {
+            if let val = remaining["value"] as? Double { return val }
+            if let val = remaining["value"] as? Int { return Double(val) }
+        }
+        return nil
+    }
+
+    private func inferWindowType(bucketId: String, displayName: String) -> UsageLimit.WindowType {
+        let combined = (bucketId + " " + displayName).lowercased()
+        if combined.contains("weekly") || combined.contains("7d") || combined.contains("seven day") {
+            return .weekly
+        }
+        if combined.contains("five") || combined.contains("5h") || combined.contains("5-hour") || combined.contains("5 hour") {
+            return .fiveHour
+        }
+        return .fiveHour
+    }
+
+    // MARK: - Language Server Response Parsing (GetUserStatus fallback)
 
     private func parseLanguageServerResponse(_ data: Data) throws -> [UsageGroup] {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -415,13 +587,7 @@ struct AntigravityService: UsageService {
         let cascadeData = userStatus["cascadeModelConfigData"] as? [String: Any] ?? [:]
         let configs = cascadeData["clientModelConfigs"] as? [[String: Any]] ?? []
 
-        struct ModelQuota {
-            let label: String
-            let remainingFraction: Double
-            let resetTime: String?
-        }
-
-        var allModels: [ModelQuota] = []
+        var allModels: [ModelQuotaEntry] = []
         for config in configs {
             guard let quotaInfo = config["quotaInfo"] as? [String: Any] else { continue }
             let remaining: Double
@@ -434,64 +600,15 @@ struct AntigravityService: UsageService {
             }
             let label = config["label"] as? String ?? config["modelLabel"] as? String ?? "Unknown"
             let resetStr = quotaInfo["resetTime"] as? String ?? quotaInfo["reset_time"] as? String
-            allModels.append(ModelQuota(label: label, remainingFraction: remaining, resetTime: resetStr))
+            allModels.append(ModelQuotaEntry(label: label, remainingFraction: remaining, resetTime: resetStr))
         }
 
-        // Group into 3 buckets
-        enum LSBucket { case geminiPro, geminiFlash, cloud }
-
-        func classifyLSModel(_ label: String) -> LSBucket {
-            let lower = label.lowercased()
-            if lower.contains("gemini") && lower.contains("pro") { return .geminiPro }
-            if lower.contains("gemini") && lower.contains("flash") { return .geminiFlash }
-            return .cloud
-        }
-
-        var geminiPro: [ModelQuota] = []
-        var geminiFlash: [ModelQuota] = []
-        var cloud: [ModelQuota] = []
-
-        for model in allModels {
-            switch classifyLSModel(model.label) {
-            case .geminiPro: geminiPro.append(model)
-            case .geminiFlash: geminiFlash.append(model)
-            case .cloud: cloud.append(model)
-            }
-        }
-
-        var limits: [UsageLimit] = []
-
-        func buildLSLimit(name: String, models: [ModelQuota]) -> UsageLimit? {
-            guard let rep = models.first else { return nil }
-            let (adjustedUsed, resetDetail) = TimeFormatter.adjustForStaleReset(
-                percentUsed: 1.0 - rep.remainingFraction,
-                resetDateString: rep.resetTime,
-                windowSeconds: TimeFormatter.fiveHourSeconds
-            )
-            let modelsStr = models.map(\.label).joined(separator: ", ")
-            var detail = modelsStr
-            if let rd = resetDetail, !rd.isEmpty {
-                detail = "\(modelsStr) · \(rd)"
-            }
-            return UsageLimit(name: name, percentUsed: adjustedUsed, detail: detail, windowType: .fiveHour)
-        }
-
-        if let l = buildLSLimit(name: "Gemini Pro", models: geminiPro) { limits.append(l) }
-        if let l = buildLSLimit(name: "Gemini Flash", models: geminiFlash) { limits.append(l) }
-        if let l = buildLSLimit(name: "Cloud", models: cloud) { limits.append(l) }
-
-        // Add credits info
+        var groups = buildAntigravityUsageGroups(from: allModels)
         let creditLimits = parseCredits(userStatus)
-        limits.append(contentsOf: creditLimits)
-
-        if limits.isEmpty {
-            let email = userStatus["email"] as? String ?? "Connected"
-            return [UsageGroup(name: "Antigravity", limits: [
-                UsageLimit(name: email, percentUsed: 0, detail: "No quota data", windowType: .unknown)
-            ])]
+        if !creditLimits.isEmpty, let first = groups.first {
+            groups = [UsageGroup(name: first.name, limits: first.limits + creditLimits)]
         }
-
-        return [UsageGroup(name: "Antigravity", limits: limits)]
+        return groups
     }
 
     // MARK: - Credits

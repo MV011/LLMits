@@ -28,12 +28,36 @@ class UsageDashboardViewModel: ObservableObject {
 
     private var lastDiscoveredServers: [AntigravityServerInfo] = []
     private var lastDiscoveryTime: Date?
+    private var latestAccounts: [Account] = []
 
-    func refreshAll(accounts: [Account]) {
+    func refreshAll(accounts: [Account], force: Bool = false) {
         // Guard against concurrent refreshes
         guard !isRefreshing else {
             debugLog("[Dashboard] skipping refresh — already in progress")
             return
+        }
+
+        latestAccounts = accounts
+
+        // Stale-while-revalidate: keep existing data visible unless this is a forced refresh
+        // or we have no cached rows for an account yet.
+        accountUsages = accounts.map { account in
+            if let existing = accountUsages.first(where: { $0.account.id == account.id }) {
+                return AccountUsageData(
+                    id: account.id,
+                    account: account,
+                    groups: existing.groups,
+                    isLoading: force || existing.groups.isEmpty,
+                    error: nil
+                )
+            }
+            return AccountUsageData(
+                id: account.id,
+                account: account,
+                groups: [],
+                isLoading: true,
+                error: nil
+            )
         }
 
         Task {
@@ -57,26 +81,6 @@ class UsageDashboardViewModel: ObservableObject {
                 }
             } else {
                 antigravityServers = []
-            }
-
-            // Initialize entries for all accounts
-            accountUsages = accounts.map { account in
-                if let existing = accountUsages.first(where: { $0.account.id == account.id }) {
-                    return AccountUsageData(
-                        id: account.id,
-                        account: account,
-                        groups: existing.groups,
-                        isLoading: true,
-                        error: nil
-                    )
-                }
-                return AccountUsageData(
-                    id: account.id,
-                    account: account,
-                    groups: [],
-                    isLoading: true,
-                    error: nil
-                )
             }
 
             // Build service + token map on main actor
@@ -125,18 +129,21 @@ class UsageDashboardViewModel: ObservableObject {
         }
     }
 
-    func startAutoRefresh(accounts: [Account]) {
-        // Only refresh if data is stale (>2 min since last refresh)
-        let isStale = lastRefreshed == nil || Date().timeIntervalSince(lastRefreshed!) > 120
+    func refreshOnAppear(accounts: [Account]) {
+        latestAccounts = accounts
+        let isStale = lastRefreshed.map { Date().timeIntervalSince($0) > 60 } ?? true
         if isStale {
             refreshAll(accounts: accounts)
         }
+        startPeriodicRefresh()
+    }
 
-        // Set up timer only if not already running (10 min interval)
+    private func startPeriodicRefresh() {
         guard refreshTimer == nil else { return }
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 600, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                self?.refreshAll(accounts: accounts)
+                guard let self else { return }
+                self.refreshAll(accounts: self.latestAccounts)
             }
         }
     }

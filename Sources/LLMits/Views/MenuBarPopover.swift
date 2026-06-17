@@ -27,7 +27,13 @@ struct MenuBarPopover: View {
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {
             accountsVM.runAutoDiscoveryIfNeeded()
-            dashboardVM.startAutoRefresh(accounts: accountsVM.accounts)
+            dashboardVM.refreshOnAppear(accounts: accountsVM.accounts)
+        }
+        .onChange(of: accountsVM.accounts) { oldAccounts, newAccounts in
+            let oldIds = Set(oldAccounts.map(\.id))
+            let newIds = Set(newAccounts.map(\.id))
+            guard oldIds != newIds else { return }
+            dashboardVM.refreshAll(accounts: newAccounts)
         }
         .onDisappear {
             dashboardVM.stopAutoRefresh()
@@ -54,7 +60,7 @@ struct MenuBarPopover: View {
                 Spacer()
 
                 Button {
-                    dashboardVM.refreshAll(accounts: accountsVM.accounts)
+                    dashboardVM.refreshAll(accounts: accountsVM.accounts, force: true)
                 } label: {
                     Image(systemName: "arrow.clockwise")
                         .font(.system(size: 12, weight: .semibold))

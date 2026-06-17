@@ -7,6 +7,27 @@ struct UsageLimit: Identifiable {
     let percentUsed: Double        // 0.0 – 1.0
     let detail: String?            // e.g. "Resets in 2h 34m"
     let windowType: WindowType
+    /// `.remaining` shows "62% left" (Anthropic/OpenAI). `.used` shows "38%" like Cursor's dashboard.
+    let percentDisplay: PercentDisplay
+
+    init(
+        name: String,
+        percentUsed: Double,
+        detail: String? = nil,
+        windowType: WindowType,
+        percentDisplay: PercentDisplay = .remaining
+    ) {
+        self.name = name
+        self.percentUsed = percentUsed
+        self.detail = detail
+        self.windowType = windowType
+        self.percentDisplay = percentDisplay
+    }
+
+    enum PercentDisplay {
+        case remaining
+        case used
+    }
 
     var percentRemaining: Double { 1.0 - percentUsed }
 

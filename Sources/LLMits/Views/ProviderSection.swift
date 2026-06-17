@@ -151,6 +151,20 @@ struct ProviderSection: View {
                     percentBadge(remaining: Int(first.percentRemaining * 100), color: first.limitColor)
                 }
             }
+        } else if provider == .cursor {
+            let auto = allLimits.first { $0.name == "Auto + Composer" }
+            let api = allLimits.first { $0.name == "API" }
+            HStack(spacing: 4) {
+                if let auto {
+                    cursorUsedBadge(label: "Auto", limit: auto)
+                }
+                if let api {
+                    cursorUsedBadge(label: "API", limit: api)
+                }
+                if auto == nil && api == nil, let first = allLimits.first {
+                    percentBadge(remaining: Int(first.percentRemaining * 100), color: first.limitColor)
+                }
+            }
         } else if let fiveH = fiveHourLimit {
             percentBadge(remaining: Int(fiveH.percentRemaining * 100), color: fiveH.limitColor)
         } else {
@@ -220,6 +234,21 @@ struct ProviderSection: View {
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
             .background(Capsule().fill(color.opacity(0.12)))
+    }
+
+    private func cursorUsedBadge(label: String, limit: UsageLimit) -> some View {
+        let used = Int(limit.percentUsed * 100)
+        return HStack(spacing: 2) {
+            Text(label)
+                .font(.system(size: 8, weight: .medium, design: .rounded))
+                .foregroundStyle(limit.limitColor.opacity(0.7))
+            Text("\(used)%")
+                .font(.system(size: 9, weight: .bold, design: .monospaced))
+                .foregroundStyle(limit.limitColor)
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 3)
+        .background(Capsule().fill(limit.limitColor.opacity(0.12)))
     }
 
     private func miniLimitBadge(label: String, limit: UsageLimit) -> some View {

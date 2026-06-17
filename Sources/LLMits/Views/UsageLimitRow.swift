@@ -6,8 +6,13 @@ struct UsageLimitRow: View {
 
     private var barColor: Color { limit.limitColor }
 
-    private var remainingText: String {
-        "\(Int(limit.percentRemaining * 100))% left"
+    private var percentLabel: String {
+        switch limit.percentDisplay {
+        case .remaining:
+            return "\(Int(limit.percentRemaining * 100))% left"
+        case .used:
+            return "\(Int(limit.percentUsed * 100))%"
+        }
     }
 
     var body: some View {
@@ -17,7 +22,7 @@ struct UsageLimitRow: View {
                     .font(.system(size: 11, weight: .medium, design: .rounded))
                     .foregroundStyle(.primary)
                 Spacer()
-                Text(remainingText)
+                Text(percentLabel)
                     .font(.system(size: 10, weight: .bold, design: .monospaced))
                     .foregroundStyle(barColor)
             }

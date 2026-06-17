@@ -242,130 +242,138 @@ struct CursorService: UsageService {
 
     // MARK: - Parsing
 
-    /// Parse the usage-summary response. Handles both individual and team plans.
+    /// Parse the usage-summary response. Aligns individual Ultra/Pro plans with the
+    /// Cursor web dashboard: Auto + Composer and API usage bars (percent-used, not dollar ratio).
     ///
-    /// Team plan response has:
-    ///   - limitType: "team"
-    ///   - individualUsage.plan (included credits)
-    ///   - individualUsage.onDemand (personal overage)
-    ///   - teamUsage.onDemand (team total spend)
-    ///
-    /// Individual plan response has:
-    ///   - limitType: "individual" or absent
-    ///   - Same individualUsage structure but no teamUsage
+    /// Team / enterprise fallbacks use `overall`, `pooled`, and on-demand spend when auto/api
+    /// fields are absent.
     private func parseUsageSummary(
         _ summary: [String: Any],
         planInfo: [String: Any]?,
         stripe: [String: Any]?
     ) -> [UsageGroup] {
-        var limits: [UsageLimit] = []
-
-        // --- Determine plan name ---
         let planInfoObj = planInfo?["planInfo"] as? [String: Any]
-        let planDisplayName = planInfoObj?["planName"] as? String
-        let planPrice = planInfoObj?["price"] as? String
         let membershipType = summary["membershipType"] as? String ?? stripe?["membershipType"] as? String ?? ""
         let limitType = summary["limitType"] as? String ?? "individual"
         let isTeam = limitType == "team"
 
         let planName: String
-        if let name = planDisplayName {
-            planName = "Cursor \(name)"
+        if let name = planInfoObj?["planName"] as? String {
+            planName = name.lowercased().hasPrefix("cursor") ? name : "Cursor \(name)"
         } else {
             planName = formatPlanName(membershipType)
         }
 
-        // --- Billing cycle reset ---
-        let cycleEnd = summary["billingCycleEnd"] as? String
-        var resetDetail: String? = nil
-        if let endStr = cycleEnd, let endDate = parseISO8601(endStr), endDate > Date() {
-            resetDetail = TimeFormatter.formatRemaining(endDate.timeIntervalSinceNow)
-        }
-        // Fallback: try planInfo's billingCycleEnd (ms timestamp)
-        if resetDetail == nil, let endMs = (planInfoObj?["billingCycleEnd"] as? String).flatMap({ Double($0) }) {
-            let endDate = Date(timeIntervalSince1970: endMs / 1000)
-            if endDate > Date() {
-                resetDetail = TimeFormatter.formatRemaining(endDate.timeIntervalSinceNow)
-            }
-        }
+        let resetSuffix = billingResetSuffix(summary: summary, planInfoObj: planInfoObj)
+        let autoMessage = summary["autoModelSelectedDisplayMessage"] as? String
+        let apiMessage = summary["namedModelSelectedDisplayMessage"] as? String
 
-        // --- Individual usage ---
+        var limits: [UsageLimit] = []
         let individual = summary["individualUsage"] as? [String: Any]
         let planUsage = individual?["plan"] as? [String: Any]
-        let onDemand = individual?["onDemand"] as? [String: Any]
 
-        // Included plan usage
         if let planUsage {
-            let used = planUsage["used"] as? Int ?? 0
-            let limit = planUsage["limit"] as? Int ?? 0
-            let apiPct = planUsage["apiPercentUsed"] as? Double ?? 0
+            let autoPct = normPercent(planUsage["autoPercentUsed"])
+            let apiPct = normPercent(planUsage["apiPercentUsed"])
 
-            if limit > 0 {
-                let pct = min(Double(used) / Double(limit), 1.0)
-                var detail = "\(formatCents(used)) / \(formatCents(limit)) included"
-                if let rd = resetDetail { detail += " · Resets in \(rd)" }
+            if let auto = autoPct {
                 limits.append(UsageLimit(
-                    name: "Included Usage",
-                    percentUsed: pct,
-                    detail: detail,
-                    windowType: .monthly
+                    name: "Auto + Composer",
+                    percentUsed: auto / 100.0,
+                    detail: composeDetail(message: autoMessage, resetSuffix: resetSuffix),
+                    windowType: .monthly,
+                    percentDisplay: .used
                 ))
             }
 
-            // Premium/API model bar — only if non-trivial and different from total
-            if apiPct > 0 && abs(apiPct - (planUsage["totalPercentUsed"] as? Double ?? 0)) > 0.01 {
-                let apiMsg = summary["namedModelSelectedDisplayMessage"] as? String
-                let detail = apiMsg ?? String(format: "%.0f%% of included API usage", apiPct)
+            if let api = apiPct {
                 limits.append(UsageLimit(
-                    name: "Premium Models",
-                    percentUsed: min(apiPct / 100.0, 1.0),
-                    detail: detail,
-                    windowType: .monthly
+                    name: "API",
+                    percentUsed: api / 100.0,
+                    detail: composeDetail(message: apiMessage, resetSuffix: nil),
+                    windowType: .monthly,
+                    percentDisplay: .used
                 ))
+            }
+
+            // Legacy / sparse plans without lane breakdown
+            if limits.isEmpty {
+                if let total = normPercent(planUsage["totalPercentUsed"]) {
+                    limits.append(UsageLimit(
+                        name: "Included",
+                        percentUsed: total / 100.0,
+                        detail: composeDetail(message: autoMessage, resetSuffix: resetSuffix),
+                        windowType: .monthly,
+                        percentDisplay: .used
+                    ))
+                } else {
+                    let used = planUsage["used"] as? Int ?? 0
+                    let limit = planUsage["limit"] as? Int ?? 0
+                    if limit > 0 {
+                        let pct = min(Double(used) / Double(limit), 1.0)
+                        var detail = "\(formatCents(used)) / \(formatCents(limit)) included"
+                        if let resetSuffix { detail += " · \(resetSuffix)" }
+                        limits.append(UsageLimit(
+                            name: "Included",
+                            percentUsed: pct,
+                            detail: detail,
+                            windowType: .monthly
+                        ))
+                    }
+                }
             }
         }
 
-        // Individual on-demand (overage)
-        if let onDemand, onDemand["enabled"] as? Bool == true {
+        // Enterprise / team member personal cap when plan block is missing or empty
+        if limits.isEmpty, let overall = individual?["overall"] as? [String: Any] {
+            appendCentsLimit(
+                name: "Personal Cap",
+                usage: overall,
+                resetSuffix: resetSuffix,
+                into: &limits
+            )
+        }
+
+        // Shared team pool (assumption-based — not verified on this machine)
+        if isTeam, let teamUsage = summary["teamUsage"] as? [String: Any],
+           let pooled = teamUsage["pooled"] as? [String: Any] {
+            appendCentsLimit(
+                name: "Team Pool",
+                usage: pooled,
+                resetSuffix: resetSuffix,
+                into: &limits
+            )
+        }
+
+        // On-demand spend (only when non-zero)
+        if let onDemand = individual?["onDemand"] as? [String: Any],
+           onDemand["enabled"] as? Bool == true {
             let usedCents = onDemand["used"] as? Int ?? 0
             if usedCents > 0 {
-                // On-demand has no limit — show as spend bar
+                var detail = "\(formatCents(usedCents)) on-demand spend"
+                if let limitCents = onDemand["limit"] as? Int, limitCents > 0 {
+                    detail += " · \(formatCents(usedCents)) / \(formatCents(limitCents))"
+                }
                 limits.append(UsageLimit(
-                    name: "Overage (You)",
-                    percentUsed: 0, // no cap to measure against
-                    detail: "\(formatCents(usedCents)) on-demand spend",
+                    name: "On-Demand",
+                    percentUsed: 0,
+                    detail: detail,
                     windowType: .monthly
                 ))
             }
         }
 
-        // --- Team usage (team plans only) ---
-        if isTeam, let teamUsage = summary["teamUsage"] as? [String: Any] {
-            let teamOnDemand = teamUsage["onDemand"] as? [String: Any]
-            let teamUsedCents = teamOnDemand?["used"] as? Int ?? 0
-            if teamUsedCents > 0 {
+        if isTeam, let teamUsage = summary["teamUsage"] as? [String: Any],
+           let teamOnDemand = teamUsage["onDemand"] as? [String: Any] {
+            let teamUsed = teamOnDemand["used"] as? Int ?? 0
+            if teamUsed > 0 {
                 limits.append(UsageLimit(
-                    name: "Team Total",
-                    percentUsed: 0, // no cap
-                    detail: "\(formatCents(teamUsedCents)) total team spend",
+                    name: "Team On-Demand",
+                    percentUsed: 0,
+                    detail: "\(formatCents(teamUsed)) team spend",
                     windowType: .monthly
                 ))
             }
-        }
-
-        // --- Plan info badge ---
-        if let price = planPrice {
-            let includedCents = planInfoObj?["includedAmountCents"] as? Int ?? 0
-            var detail = price
-            if includedCents > 0 {
-                detail += " (\(formatCents(includedCents)) included)"
-            }
-            limits.append(UsageLimit(
-                name: "Plan",
-                percentUsed: 0,
-                detail: detail,
-                windowType: .monthly
-            ))
         }
 
         if limits.isEmpty {
@@ -378,6 +386,59 @@ struct CursorService: UsageService {
         }
 
         return [UsageGroup(name: planName, limits: limits)]
+    }
+
+    private func normPercent(_ value: Any?) -> Double? {
+        let raw: Double?
+        if let d = value as? Double { raw = d }
+        else if let i = value as? Int { raw = Double(i) }
+        else { return nil }
+        guard let v = raw else { return nil }
+        if v < 0 { return 0 }
+        if v > 100 { return 100 }
+        return v
+    }
+
+    private func billingResetSuffix(summary: [String: Any], planInfoObj: [String: Any]?) -> String? {
+        if let endStr = summary["billingCycleEnd"] as? String,
+           let endDate = parseISO8601(endStr), endDate > Date(),
+           let remaining = TimeFormatter.formatRemaining(endDate.timeIntervalSinceNow) {
+            return remaining
+        }
+        if let endMs = (planInfoObj?["billingCycleEnd"] as? String).flatMap({ Double($0) }) {
+            let endDate = Date(timeIntervalSince1970: endMs / 1000)
+            if endDate > Date(), let remaining = TimeFormatter.formatRemaining(endDate.timeIntervalSinceNow) {
+                return remaining
+            }
+        }
+        return nil
+    }
+
+    private func composeDetail(message: String?, resetSuffix: String?) -> String? {
+        var parts: [String] = []
+        if let message, !message.isEmpty { parts.append(message) }
+        if let resetSuffix, !resetSuffix.isEmpty { parts.append(resetSuffix) }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    private func appendCentsLimit(
+        name: String,
+        usage: [String: Any],
+        resetSuffix: String?,
+        into limits: inout [UsageLimit]
+    ) {
+        let used = usage["used"] as? Int ?? 0
+        let limit = usage["limit"] as? Int ?? 0
+        guard limit > 0 else { return }
+        let pct = min(Double(used) / Double(limit), 1.0)
+        var detail = "\(formatCents(used)) / \(formatCents(limit))"
+        if let resetSuffix { detail += " · \(resetSuffix)" }
+        limits.append(UsageLimit(
+            name: name,
+            percentUsed: pct,
+            detail: detail,
+            windowType: .monthly
+        ))
     }
 
     // MARK: - Helpers
