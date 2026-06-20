@@ -10,39 +10,71 @@ struct OpenAIService: UsageService {
             throw ServiceError.httpError(429)
         }
 
-        let accessToken = try resolveAccessToken(manualToken: token)
+        var accessToken = try await resolveAccessToken(manualToken: token)
 
-        var request = URLRequest(url: usageURL)
-        request.httpMethod = "GET"
-        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-        request.timeoutInterval = 15
+        do {
+            var request = URLRequest(url: usageURL)
+            request.httpMethod = "GET"
+            request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+            request.timeoutInterval = 15
 
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw ServiceError.invalidResponse
-        }
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse else {
+                throw ServiceError.invalidResponse
+            }
 
-        switch httpResponse.statusCode {
-        case 200:
-            RateLimiter.shared.clear(Self.providerKey)
-            return try parseUsageResponse(data)
-        case 429:
-            RateLimiter.shared.recordLimit(Self.providerKey)
-            throw ServiceError.httpError(429)
-        default:
-            throw ServiceError.httpError(httpResponse.statusCode)
+            switch httpResponse.statusCode {
+            case 200:
+                RateLimiter.shared.clear(Self.providerKey)
+                return try parseUsageResponse(data)
+            case 401, 403:
+                throw ServiceError.noCredentials("Codex credentials expired or invalid.")
+            case 429:
+                RateLimiter.shared.recordLimit(Self.providerKey)
+                throw ServiceError.httpError(429)
+            default:
+                throw ServiceError.httpError(httpResponse.statusCode)
+            }
+        } catch ServiceError.noCredentials {
+            // Token might be stale — retry ONCE with fresh read from auth.json
+            debugLog("[OpenAI] got auth error, retrying with fresh credentials")
+            TokenCache.shared.remove(Self.providerKey)
+
+            accessToken = try await resolveAccessToken(manualToken: token, forceFresh: true)
+
+            var request = URLRequest(url: usageURL)
+            request.httpMethod = "GET"
+            request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+            request.timeoutInterval = 15
+
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse else {
+                throw ServiceError.invalidResponse
+            }
+
+            if httpResponse.statusCode == 200 {
+                RateLimiter.shared.clear(Self.providerKey)
+                return try parseUsageResponse(data)
+            } else if httpResponse.statusCode == 429 {
+                RateLimiter.shared.recordLimit(Self.providerKey)
+                throw ServiceError.httpError(429)
+            } else {
+                throw ServiceError.httpError(httpResponse.statusCode)
+            }
         }
     }
 
     // MARK: - Token Resolution
 
-    private func resolveAccessToken(manualToken: String) throws -> String {
+    private func resolveAccessToken(manualToken: String, forceFresh: Bool = false) async throws -> String {
         if manualToken != "mock-token" && !manualToken.isEmpty {
             return manualToken
         }
 
-        if let cached = TokenCache.shared.get(Self.providerKey) {
-            return cached
+        if !forceFresh {
+            if let cached = TokenCache.shared.get(Self.providerKey) {
+                return cached
+            }
         }
 
         if let token = loadFromAuthJSON() {

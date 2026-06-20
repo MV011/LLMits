@@ -30,6 +30,12 @@ final class TokenCache {
         objectCache.removeValue(forKey: key)
     }
 
+    func removeObject(_ key: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        objectCache.removeValue(forKey: key)
+    }
+
     func getObject<T>(_ key: String) -> T? {
         lock.lock()
         defer { lock.unlock() }

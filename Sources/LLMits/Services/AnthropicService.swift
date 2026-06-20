@@ -182,7 +182,7 @@ actor TokenResolver {
     private init() {}
 
     /// Resolve the access token. Uses cache if valid, otherwise reads from Keychain/file.
-    func resolve(manualToken: String) throws -> String {
+    func resolve(manualToken: String) async throws -> String {
         // Manual token passthrough
         if manualToken != "mock-token" && manualToken != "mock" && !manualToken.isEmpty {
             return manualToken
@@ -198,7 +198,7 @@ actor TokenResolver {
             debugLog("[TokenResolver] cached token expired, will re-read")
         }
 
-        return try readFreshCredentials()
+        return try await readFreshCredentials()
     }
 
     /// Clear the cache, forcing a fresh Keychain/file read on next resolve().
@@ -209,7 +209,10 @@ actor TokenResolver {
 
     /// Read fresh credentials from Keychain (primary) or credentials files (fallback).
     /// Throttled to prevent hammering the Keychain on repeated failures.
-    private func readFreshCredentials() throws -> String {
+    /// The actual Keychain SecItem access is offloaded to a GCD queue so we don't block
+    /// Swift concurrency cooperative threads (or the main thread) while waiting for
+    /// the user to approve the keychain permission dialog.
+    private func readFreshCredentials() async throws -> String {
         // Throttle: don't re-read Keychain more than once per `minReadInterval`
         if let lastRead = lastReadTime,
            Date().timeIntervalSince(lastRead) < minReadInterval,
@@ -219,7 +222,7 @@ actor TokenResolver {
         }
 
         debugLog("[TokenResolver] reading fresh credentials from Keychain/file")
-        guard let creds = Self.loadCredentials() else {
+        guard let creds = await Self.loadCredentialsAsync() else {
             throw ServiceError.noCredentials("Install Claude Code CLI and run 'claude' to login, or paste an OAuth token manually.")
         }
 
@@ -248,44 +251,54 @@ actor TokenResolver {
         let expiresAt: Double
     }
 
-    private static func loadCredentials() -> FullCredentials? {
-        // Try Keychain first
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "Claude Code-credentials",
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
+    /// Performs the potentially interactive / blocking Keychain lookup off the Swift
+    /// concurrency thread pool (and off the main thread) by dispatching to GCD.
+    /// This prevents the app from appearing frozen while the user approves the
+    /// Keychain permission dialog for "Claude Code-credentials".
+    private static func loadCredentialsAsync() async -> FullCredentials? {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                // === Original blocking Keychain + file fallback logic ===
+                let query: [String: Any] = [
+                    kSecClass as String: kSecClassGenericPassword,
+                    kSecAttrService as String: "Claude Code-credentials",
+                    kSecReturnData as String: true,
+                    kSecMatchLimit as String: kSecMatchLimitOne
+                ]
 
-        var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
+                var result: AnyObject?
+                let status = SecItemCopyMatching(query as CFDictionary, &result)
 
-        if status == errSecSuccess, let data = result as? Data,
-           let jsonStr = String(data: data, encoding: .utf8),
-           let creds = parseCredentials(jsonStr) {
-            debugLog("[TokenResolver] loaded credentials from Keychain")
-            return creds
-        }
+                if status == errSecSuccess, let data = result as? Data,
+                   let jsonStr = String(data: data, encoding: .utf8),
+                   let creds = parseCredentials(jsonStr) {
+                    debugLog("[TokenResolver] loaded credentials from Keychain")
+                    continuation.resume(returning: creds)
+                    return
+                }
 
-        if status != errSecSuccess && status != errSecItemNotFound {
-            debugLog("[TokenResolver] Keychain error: \(status)")
-        }
+                if status != errSecSuccess && status != errSecItemNotFound {
+                    debugLog("[TokenResolver] Keychain error: \(status)")
+                }
 
-        // Try credentials files as fallback
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        for path in [
-            home.appendingPathComponent(".claude/.credentials.json"),
-            home.appendingPathComponent(".claude/credentials.json"),
-        ] {
-            if let data = try? Data(contentsOf: path),
-               let jsonStr = String(data: data, encoding: .utf8),
-               let creds = parseCredentials(jsonStr) {
-                debugLog("[TokenResolver] loaded credentials from \(path.lastPathComponent)")
-                return creds
+                // Try credentials files as fallback
+                let home = FileManager.default.homeDirectoryForCurrentUser
+                for path in [
+                    home.appendingPathComponent(".claude/.credentials.json"),
+                    home.appendingPathComponent(".claude/credentials.json"),
+                ] {
+                    if let data = try? Data(contentsOf: path),
+                       let jsonStr = String(data: data, encoding: .utf8),
+                       let creds = parseCredentials(jsonStr) {
+                        debugLog("[TokenResolver] loaded credentials from \(path.lastPathComponent)")
+                        continuation.resume(returning: creds)
+                        return
+                    }
+                }
+
+                continuation.resume(returning: nil)
             }
         }
-
-        return nil
     }
 
     private static func parseCredentials(_ json: String) -> FullCredentials? {

@@ -10,7 +10,7 @@ class AccountsViewModel: ObservableObject {
 
     private let accountsKey = "llmits.accounts"
     // Bump the version suffix when new auto-discoverable providers are added
-    private let hasRunAutoDiscoveryKey = "llmits.hasRunAutoDiscovery.v3"
+    private let hasRunAutoDiscoveryKey = "llmits.hasRunAutoDiscovery.v4"
 
     init() {
         loadAccounts()
@@ -27,6 +27,7 @@ class AccountsViewModel: ObservableObject {
             let hasCodex = Self.hasCodexCredentials()
             let hasAntigravity = Self.isAntigravityAvailable()
             let hasCursor = CursorService.readCursorJWT() != nil
+            let hasGrok = Self.hasGrokCredentials()
 
             // Capture weak self before entering MainActor context
             guard let vm = self else { return }
@@ -42,6 +43,9 @@ class AccountsViewModel: ObservableObject {
                 }
                 if hasCursor && vm.accountsFor(provider: .cursor).isEmpty {
                     vm.addAccount(provider: .cursor, displayName: "Cursor", token: "mock-token")
+                }
+                if hasGrok && vm.accountsFor(provider: .grok).isEmpty {
+                    vm.addAccount(provider: .grok, displayName: "Grok Build", token: "mock-token")
                 }
             }
         }
@@ -93,6 +97,13 @@ class AccountsViewModel: ObservableObject {
         )
     }
 
+    nonisolated private static func hasGrokCredentials() -> Bool {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        return FileManager.default.fileExists(
+            atPath: home.appendingPathComponent(".grok/auth.json").path
+        )
+    }
+
     /// Detect Antigravity availability: checks for running processes (desktop app or agy CLI)
     /// AND the OAuth credentials file used by both surfaces.
     nonisolated private static func isAntigravityAvailable() -> Bool {
@@ -104,21 +115,10 @@ class AccountsViewModel: ObservableObject {
         if hasOAuthCreds { return true }
 
         // Check 2: Antigravity desktop app or agy CLI is running
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/ps")
-        process.arguments = ["-ax", "-o", "command="]
-
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = Pipe()
-
-        guard (try? process.run()) != nil else { return false }
-
-        // Read pipe BEFORE waitUntilExit to avoid pipe buffer deadlock
-        let outputData = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-
-        let output = String(data: outputData, encoding: .utf8) ?? ""
+        guard let output = ProcessRunner.captureOutput(
+            executable: "/bin/ps",
+            arguments: ["-ax", "-o", "command="]
+        ) else { return false }
         // Detect desktop app language server
         if output.contains("language_server") && output.contains("antigravity") {
             return true

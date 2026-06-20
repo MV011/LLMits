@@ -10,11 +10,17 @@ func debugLog(_ msg: String) {
     let sanitized = redactTokens(msg)
     let line = "\(Date()): \(sanitized)\n"
 
-    guard let data = line.data(using: .utf8),
-          let fh = FileHandle(forWritingAtPath: logPath) else { return }
-    fh.seekToEndOfFile()
-    fh.write(data)
-    fh.closeFile()
+    guard let data = line.data(using: .utf8) else { return }
+
+    // Use URL + append to avoid repeated open/close churn (still not perfect but better)
+    let url = URL(fileURLWithPath: logPath)
+    if let handle = try? FileHandle(forWritingTo: url) {
+        defer { try? handle.close() }
+        try? handle.seekToEnd()
+        handle.write(data)
+    } else {
+        try? data.write(to: url, options: .atomic)
+    }
 }
 
 /// Strips token values from log messages, keeping only the first 6 chars.

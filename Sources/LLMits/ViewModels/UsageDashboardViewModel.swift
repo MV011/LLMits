@@ -23,6 +23,7 @@ class UsageDashboardViewModel: ObservableObject {
         case .openai: return OpenAIService()
         case .antigravity: return AntigravityService(cachedServers: antigravityServers)
         case .cursor: return CursorService()
+        case .grok: return GrokService()
         }
     }
 
@@ -74,7 +75,11 @@ class UsageDashboardViewModel: ObservableObject {
                     antigravityServers = lastDiscoveredServers
                     debugLog("[Dashboard] reusing \(antigravityServers.count) cached Antigravity servers")
                 } else {
-                    antigravityServers = discoverAntigravityServers()
+                    // Offload the Process + wait so we don't block the current task's thread
+                    // (the function itself documents it must be outside task groups due to wait).
+                    antigravityServers = await Task.detached {
+                        discoverAntigravityServers()
+                    }.value
                     lastDiscoveredServers = antigravityServers
                     lastDiscoveryTime = Date()
                     debugLog("[Dashboard] discovered \(antigravityServers.count) Antigravity servers")
@@ -83,11 +88,26 @@ class UsageDashboardViewModel: ObservableObject {
                 antigravityServers = []
             }
 
-            // Build service + token map on main actor
+            // Build service + token map (offload cheap file reads for cleanliness)
+            let accountsForTasks = accounts
+            let tokens = await withTaskGroup(of: (Int, String).self) { group -> [Int: String] in
+                var map: [Int: String] = [:]
+                for (i, account) in accountsForTasks.enumerated() {
+                    group.addTask {
+                        let t = KeychainManager.load(key: account.tokenKeychainKey) ?? "mock"
+                        return (i, t)
+                    }
+                }
+                for await (i, t) in group {
+                    map[i] = t
+                }
+                return map
+            }
+
             var tasks: [(UUID, UsageService, String)] = []
-            for account in accounts {
+            for (i, account) in accountsForTasks.enumerated() {
                 let svc = service(for: account.provider, antigravityServers: antigravityServers)
-                let token = KeychainManager.load(key: account.tokenKeychainKey) ?? "mock"
+                let token = tokens[i] ?? "mock"
                 debugLog("[Dashboard] queuing \(account.provider.rawValue) token=\(String(token.prefix(10)))")
                 tasks.append((account.id, svc, token))
             }

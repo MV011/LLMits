@@ -14,6 +14,7 @@ A lightweight macOS menu bar app that tracks your AI coding tool usage and limit
 | **OpenAI** (Codex CLI) | Auto-discovered from `~/.codex/auth.json` | 5h session limits, weekly limits, code review, credit balance |
 | **Cursor** | Auto-discovered from local SQLite DB | Premium requests, extra usage |
 | **Antigravity** | Auto-discovered from running server | Per-model quotas with 5h reset windows |
+| **xAI (Grok Build)** | Auto-discovered from `~/.grok/auth.json` | Monthly subscription credits (SuperGrok / X Premium+) |
 
 ## Features
 
@@ -62,6 +63,8 @@ LLMits automatically finds your credentials — no manual setup required:
 - **Codex CLI** — reads from `~/.codex/auth.json` (or `$CODEX_HOME/auth.json`)
 - **Cursor** — reads JWT from `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb`
 - **Antigravity** — discovers running language server processes via `ps`
+- **Grok Build** — reads OAuth session from `~/.grok/auth.json`
+- **Grok Build** — reads session token from `~/.grok/auth.json` (after `grok login`)
 
 ### Manual Token Entry
 
@@ -80,6 +83,7 @@ Sources/Perihelion/
 │   ├── OpenAIService.swift       # Codex CLI usage API
 │   ├── CursorService.swift       # Cursor SQLite + cookie auth
 │   ├── AntigravityService.swift  # Local server discovery + quota API
+│   ├── GrokService.swift         # Grok Build auth.json + billing API
 │   ├── KeychainManager.swift     # File-based token storage
 │   ├── TokenCache.swift          # In-memory credential cache
 │   └── TimeFormatter.swift       # Reset countdown formatting

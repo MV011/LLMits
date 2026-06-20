@@ -22,14 +22,14 @@ struct CursorService: UsageService {
             throw ServiceError.httpError(429)
         }
 
-        let cookie = try resolveCookie(manualToken: token)
+        let cookie = try await resolveCookie(manualToken: token)
 
         do {
             return try await fetchWithCookie(cookie)
         } catch ServiceError.httpError(let code) where code == 401 || code == 403 {
             // Session may have been refreshed by Cursor IDE — re-read the DB
             debugLog("[Cursor] got \(code), re-reading DB for fresh tokens")
-            guard let freshCookie = Self.buildCookieFromDB() else {
+            guard let freshCookie = await Self.buildCookieFromDBAsync() else {
                 throw ServiceError.noCredentials(
                     "Cursor session expired. Open Cursor to refresh, then retry."
                 )
@@ -61,9 +61,9 @@ struct CursorService: UsageService {
 
     // MARK: - Cookie Resolution
 
-    private func resolveCookie(manualToken: String) throws -> String {
-        // Auto-discover from Cursor's SQLite state database
-        if let cookie = Self.buildCookieFromDB() {
+    private func resolveCookie(manualToken: String) async throws -> String {
+        // Auto-discover from Cursor's SQLite state database (offloaded to avoid blocking)
+        if let cookie = await Self.buildCookieFromDBAsync() {
             return cookie
         }
 
@@ -78,9 +78,18 @@ struct CursorService: UsageService {
         throw ServiceError.noCredentials("Cursor is not logged in. Open Cursor and sign in, then retry.")
     }
 
-    /// Reads tokens from Cursor's globalStorage/state.vscdb and builds
-    /// the correct cookie format: workos_id=USER_ID; WorkosCursorSessionToken=USER_ID::JWT
-    static func buildCookieFromDB() -> String? {
+    /// Async version that offloads the blocking sqlite3 Process + wait to GCD.
+    /// Prevents pinning Swift concurrency threads while spawning external processes.
+    static func buildCookieFromDBAsync() async -> String? {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(returning: buildCookieFromDBSync())
+            }
+        }
+    }
+
+    /// Synchronous implementation (used by the async wrapper and legacy discovery).
+    private static func buildCookieFromDBSync() -> String? {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let dbPath = home
             .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
@@ -88,23 +97,14 @@ struct CursorService: UsageService {
 
         guard FileManager.default.fileExists(atPath: dbPath) else { return nil }
 
-        // Use sqlite3 to read tokens
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
-        process.arguments = [dbPath, """
-            SELECT key, value FROM ItemTable 
-            WHERE key IN ('cursorAuth/accessToken', 'cursorAuth/refreshToken');
-        """]
-
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = Pipe()
-
-        guard (try? process.run()) != nil else { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-
-        let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        // Use sqlite3 to read tokens (via helper to centralize Process logic)
+        guard let output = ProcessRunner.captureOutput(
+            executable: "/usr/bin/sqlite3",
+            arguments: [dbPath, """
+                SELECT key, value FROM ItemTable 
+                WHERE key IN ('cursorAuth/accessToken', 'cursorAuth/refreshToken');
+            """]
+        ) else { return nil }
 
         var accessToken: String?
         var refreshToken: String?
@@ -134,6 +134,11 @@ struct CursorService: UsageService {
 
         // Cookie format: workos_id=USER_ID; WorkosCursorSessionToken=USER_ID%3A%3AJWT
         return "workos_id=\(userId); WorkosCursorSessionToken=\(userId)%3A%3A\(jwt)"
+    }
+
+    // Keep the old name as alias for discovery (which runs in detached task)
+    static func buildCookieFromDB() -> String? {
+        buildCookieFromDBSync()
     }
 
     /// Decodes a JWT and extracts the workos user ID from the `sub` claim

@@ -5,6 +5,7 @@ enum Provider: String, Codable, CaseIterable, Identifiable {
     case openai
     case antigravity
     case cursor
+    case grok
 
     var id: String { rawValue }
 
@@ -14,6 +15,7 @@ enum Provider: String, Codable, CaseIterable, Identifiable {
         case .openai: return "OpenAI (Codex / ChatGPT)"
         case .antigravity: return "Antigravity"
         case .cursor: return "Cursor"
+        case .grok: return "xAI (Grok Build)"
         }
     }
 
@@ -49,6 +51,7 @@ enum Provider: String, Codable, CaseIterable, Identifiable {
         case .openai: return Color(red: 0.34, green: 0.76, blue: 0.67)      // teal
         case .antigravity: return Color(red: 0.26, green: 0.52, blue: 0.96) // blue
         case .cursor: return Color(red: 0.60, green: 0.40, blue: 0.90)      // purple
+        case .grok: return Color(red: 0.0, green: 0.0, blue: 0.0)           // black (xAI)
         }
     }
 
@@ -58,13 +61,14 @@ enum Provider: String, Codable, CaseIterable, Identifiable {
         case .openai: return "Session Token (from chatgpt.com)"
         case .antigravity: return "Auto-discovered from ~/.gemini (no token needed)"
         case .cursor: return "Session Token (from cursor.com)"
+        case .grok: return "Auto-discovered from ~/.grok/auth.json (Grok Build)"
         }
     }
 
     /// Whether this provider auto-discovers credentials (no manual token paste)
     var isAutoDiscovered: Bool {
         switch self {
-        case .antigravity: return true
+        case .antigravity, .grok: return true
         default: return false
         }
     }

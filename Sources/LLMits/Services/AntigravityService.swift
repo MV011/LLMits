@@ -20,18 +20,13 @@ func discoverAntigravityServers() -> [AntigravityServerInfo] {
     process.standardOutput = pipe
     process.standardError = Pipe()
 
-    do {
-        try process.run()
-    } catch {
-        debugLog("[Antigravity] ps failed: \(error)")
+    guard let output = ProcessRunner.captureOutput(
+        executable: "/bin/ps",
+        arguments: ["-ax", "-o", "pid=,command="]
+    ) else {
+        debugLog("[Antigravity] ps failed")
         return []
     }
-
-    // CRITICAL: Read pipe BEFORE waitUntilExit to avoid pipe buffer deadlock.
-    let outputData = pipe.fileHandleForReading.readDataToEndOfFile()
-    process.waitUntilExit()
-
-    let output = String(data: outputData, encoding: .utf8) ?? ""
     var servers: [AntigravityServerInfo] = []
 
     for line in output.components(separatedBy: "\n") {
@@ -86,20 +81,11 @@ private func isAgyServerProcess(_ command: String) -> Bool {
 }
 
 private func discoverListeningPorts(pid: String) -> [Int] {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
-    process.arguments = ["-nP", "-iTCP", "-sTCP:LISTEN", "-a", "-p", pid]
+    guard let output = ProcessRunner.captureOutput(
+        executable: "/usr/sbin/lsof",
+        arguments: ["-nP", "-iTCP", "-sTCP:LISTEN", "-a", "-p", pid]
+    ) else { return [] }
 
-    let pipe = Pipe()
-    process.standardOutput = pipe
-    process.standardError = Pipe()
-
-    guard (try? process.run()) != nil else { return [] }
-
-    let outputData = pipe.fileHandleForReading.readDataToEndOfFile()
-    process.waitUntilExit()
-
-    let output = String(data: outputData, encoding: .utf8) ?? ""
     var ports: [Int] = []
 
     for line in output.components(separatedBy: "\n") {
