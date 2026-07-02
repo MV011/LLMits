@@ -337,6 +337,11 @@ struct MenuBarPopover: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(account.displayName)
                     .font(.system(size: 12, weight: .medium, design: .rounded))
+                if let identity = dashboardVM.accountUsages.first(where: { $0.id == account.id })?.identity {
+                    Text(identity)
+                        .font(.system(size: 10, design: .rounded))
+                        .foregroundStyle(.tertiary)
+                }
                 Text(hasToken ? "Token configured" : "No token")
                     .font(.system(size: 10, design: .rounded))
                     .foregroundStyle(hasToken ? .green : .orange)

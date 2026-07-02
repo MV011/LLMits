@@ -115,6 +115,16 @@ struct AntigravityService: UsageService {
 
     var cachedServers: [AntigravityServerInfo] = []
 
+    /// The active Google account email from ~/.gemini/google_accounts.json.
+    func currentIdentity() async -> String? {
+        await withCheckedContinuation { cont in
+            DispatchQueue.global(qos: .utility).async {
+                let email = GoogleOAuthHelper.readAccountEmail()
+                cont.resume(returning: email == "Antigravity" ? nil : email)
+            }
+        }
+    }
+
     func fetchUsage(token: String) async throws -> [UsageGroup] {
         if RateLimiter.shared.isLimited(Self.providerKey) {
             let remaining = RateLimiter.shared.remainingSeconds(Self.providerKey)

@@ -174,14 +174,28 @@ struct ProviderSection: View {
         }
     }
 
+    /// Header line above an account's limits. Shows the live credential's
+    /// identity (email/user id) so the label follows CLI account switches;
+    /// the stored display name is kept only to disambiguate multiple accounts.
+    private func accountHeader(_ usage: AccountUsageData) -> String? {
+        if usages.count > 1 {
+            if let identity = usage.identity,
+               identity.localizedCaseInsensitiveCompare(usage.account.displayName) != .orderedSame {
+                return "\(usage.account.displayName) · \(identity)"
+            }
+            return usage.account.displayName
+        }
+        return usage.identity
+    }
+
     @ViewBuilder
     private func accountContent(_ usage: AccountUsageData) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            if usages.count > 1 {
-                Text(usage.account.displayName)
+            if let header = accountHeader(usage) {
+                Text(header)
                     .font(.system(size: 10, weight: .bold, design: .rounded))
                     .foregroundStyle(.secondary)
-                    .textCase(.uppercase)
+                    .textCase(usage.identity == nil ? .uppercase : nil)
                     .padding(.leading, 4)
                     .padding(.top, 2)
             }

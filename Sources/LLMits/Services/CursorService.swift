@@ -27,8 +27,12 @@ struct CursorService: UsageService {
         do {
             return try await fetchWithCookie(cookie)
         } catch ServiceError.httpError(let code) where code == 401 || code == 403 {
-            // Session may have been refreshed by Cursor IDE — re-read the DB
+            // Session may have been refreshed by Cursor IDE — re-read the DB.
+            // The first read happened milliseconds ago, so give an in-flight
+            // token rotation a moment to land in state.vscdb before re-reading;
+            // otherwise the re-read is always identical and the retry never fires.
             debugLog("[Cursor] got \(code), re-reading DB for fresh tokens")
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
             guard let freshCookie = await Self.buildCookieFromDBAsync() else {
                 throw ServiceError.noCredentials(
                     "Cursor session expired. Open Cursor to refresh, then retry."
@@ -88,8 +92,26 @@ struct CursorService: UsageService {
         }
     }
 
+    /// The workos user id of the account Cursor is logged into, from the JWT
+    /// sub claim in state.vscdb. Local read only (Cursor exposes no email there).
+    func currentIdentity() async -> String? {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                continuation.resume(returning: Self.readAuthTokensSync()?.userId)
+            }
+        }
+    }
+
     /// Synchronous implementation (used by the async wrapper and legacy discovery).
     private static func buildCookieFromDBSync() -> String? {
+        guard let (userId, jwt) = readAuthTokensSync() else { return nil }
+        // Cookie format: workos_id=USER_ID; WorkosCursorSessionToken=USER_ID%3A%3AJWT
+        return "workos_id=\(userId); WorkosCursorSessionToken=\(userId)%3A%3A\(jwt)"
+    }
+
+    /// Reads the auth JWT + workos user id from Cursor's SQLite state database.
+    /// Also used by CredentialWatcher to fingerprint the Cursor session.
+    static func readAuthTokensSync() -> (userId: String, jwt: String)? {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let dbPath = home
             .appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
@@ -132,8 +154,7 @@ struct CursorService: UsageService {
         let userId = extractUserIdFromJWT(jwt) ?? extractUserIdFromJWT(accessToken ?? "")
         guard let userId else { return nil }
 
-        // Cookie format: workos_id=USER_ID; WorkosCursorSessionToken=USER_ID%3A%3AJWT
-        return "workos_id=\(userId); WorkosCursorSessionToken=\(userId)%3A%3A\(jwt)"
+        return (userId, jwt)
     }
 
     // Keep the old name as alias for discovery (which runs in detached task)
@@ -143,17 +164,7 @@ struct CursorService: UsageService {
 
     /// Decodes a JWT and extracts the workos user ID from the `sub` claim
     private static func extractUserIdFromJWT(_ jwt: String) -> String? {
-        let parts = jwt.split(separator: ".")
-        guard parts.count >= 2 else { return nil }
-
-        var base64 = String(parts[1])
-        while base64.count % 4 != 0 { base64 += "=" }
-
-        guard let data = Data(base64Encoded: base64),
-              let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let sub = payload["sub"] as? String else {
-            return nil
-        }
+        guard let sub = JWT.payload(jwt)?["sub"] as? String else { return nil }
 
         // sub is like "google-oauth2|user_01JFHV3WC4W87Q7CSWGSPGS3MP"
         if sub.contains("|") {

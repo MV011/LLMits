@@ -47,19 +47,31 @@ enum GoogleOAuthHelper {
     // MARK: - Resolve (with auto-refresh)
 
     /// Returns a valid access token, refreshing proactively if expired.
+    /// Refreshed tokens are persisted back to ~/.gemini/oauth_creds.json so the
+    /// CLI and subsequent requests reuse them instead of re-refreshing every call.
     static func resolveAccessToken(_ creds: OAuthCreds) async throws -> String {
+        var knownExpired = false
         if let expiry = creds.expiryDate {
             let expiryDate = Date(timeIntervalSince1970: expiry / 1000)
             if expiryDate > Date().addingTimeInterval(60) {
                 return creds.accessToken
             }
+            knownExpired = true
         }
 
         if let refreshToken = creds.refreshToken {
             do {
-                return try await refreshAccessToken(refreshToken: refreshToken)
+                return try await refreshAndPersist(refreshToken: refreshToken)
+            } catch where knownExpired {
+                // The old token is guaranteed dead — surface the real cause
+                // instead of deferring to a downstream 401.
+                debugLog("[GoogleOAuth] Token refresh failed for expired token: \(error)")
+                throw ServiceError.noCredentials(
+                    "Google session expired and refresh failed. Re-authenticate with: agy"
+                )
             } catch {
-                debugLog("[GoogleOAuth] Token refresh failed: \(error), using existing token")
+                // Expiry unknown — the existing token may still work, so fall through.
+                debugLog("[GoogleOAuth] Token refresh failed: \(error), trying existing token")
             }
         }
 
@@ -67,16 +79,6 @@ enum GoogleOAuthHelper {
     }
 
     // MARK: - Refresh
-
-    /// Refresh and return a new access token (does not persist to disk).
-    static func refreshAccessToken(refreshToken: String) async throws -> String {
-        let json = try await performTokenRefresh(refreshToken: refreshToken)
-        guard let newToken = json["access_token"] as? String else {
-            throw ServiceError.parseError("Failed to parse refresh token response")
-        }
-        debugLog("[GoogleOAuth] token refreshed successfully")
-        return newToken
-    }
 
     /// Refresh the access token and write it back to ~/.gemini/oauth_creds.json
     /// so other tools (and future app launches) pick up the fresh token.
@@ -96,7 +98,11 @@ enum GoogleOAuthHelper {
             expiresIn = 3600
         }
         let newExpiryMs = (Date().timeIntervalSince1970 + expiresIn) * 1000
-        persistRefreshedToken(accessToken: newToken, expiryMs: newExpiryMs)
+        persistRefreshedToken(
+            accessToken: newToken,
+            expiryMs: newExpiryMs,
+            refreshToken: json["refresh_token"] as? String
+        )
 
         debugLog("[GoogleOAuth] token refreshed and persisted (expires in \(Int(expiresIn))s)")
         return newToken
@@ -133,8 +139,10 @@ enum GoogleOAuthHelper {
     // MARK: - Persistence
 
     /// Update ~/.gemini/oauth_creds.json with a new access token and expiry,
-    /// preserving all other fields (refresh_token, scope, etc.).
-    static func persistRefreshedToken(accessToken: String, expiryMs: Double) {
+    /// preserving all other fields (refresh_token, scope, etc.). The file is
+    /// re-read immediately before the atomic write so a refresh_token the CLI
+    /// rotated in the meantime is preserved, not clobbered.
+    static func persistRefreshedToken(accessToken: String, expiryMs: Double, refreshToken: String? = nil) {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let credsURL = home.appendingPathComponent(".gemini/oauth_creds.json")
 
@@ -147,6 +155,9 @@ enum GoogleOAuthHelper {
 
         json["access_token"] = accessToken
         json["expiry_date"] = expiryMs
+        if let refreshToken {
+            json["refresh_token"] = refreshToken
+        }
 
         guard let updatedData = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys]) else {
             debugLog("[GoogleOAuth] could not serialize updated creds")

@@ -93,7 +93,20 @@ struct GrokService: UsageService {
             }
         }
 
-        if let (token, expiresAt) = await loadFromGrokAuthJSONAsync() {
+        if let entry = await loadFromGrokAuthJSONAsync() {
+            var token = entry.token
+            var expiresAt = entry.expiresAt
+
+            // The CLI only rotates the file while it's running — self-refresh
+            // when the on-disk token is expired/expiring so tracking survives
+            // without the user reopening grok. (Skipped automatically when a
+            // live grok session or another refresher holds the lock.)
+            if let exp = expiresAt, exp.timeIntervalSinceNow < 5 * 60,
+               let refreshed = await GrokTokenRefresher.refreshIfSafe() {
+                token = refreshed.token
+                expiresAt = refreshed.expiresAt
+            }
+
             TokenCache.shared.set(Self.providerKey, value: token)
             if let exp = expiresAt {
                 TokenCache.shared.setObject(Self.providerKey + ".expiresAt", value: exp)
@@ -116,12 +129,11 @@ struct GrokService: UsageService {
         throw ServiceError.noCredentials("Install Grok Build CLI and run `grok login`, or set XAI_API_KEY.")
     }
 
-    private func loadFromGrokAuthJSON() -> (token: String, expiresAt: Date?)? {
-        // sync version for any legacy calls
-        loadFromGrokAuthJSONSync()
+    func currentIdentity() async -> String? {
+        await loadFromGrokAuthJSONAsync()?.email
     }
 
-    private func loadFromGrokAuthJSONAsync() async -> (token: String, expiresAt: Date?)? {
+    private func loadFromGrokAuthJSONAsync() async -> (token: String, expiresAt: Date?, email: String?)? {
         await withCheckedContinuation { cont in
             DispatchQueue.global(qos: .userInitiated).async {
                 cont.resume(returning: loadFromGrokAuthJSONSync())
@@ -129,7 +141,7 @@ struct GrokService: UsageService {
         }
     }
 
-    private func loadFromGrokAuthJSONSync() -> (token: String, expiresAt: Date?)? {
+    private func loadFromGrokAuthJSONSync() -> (token: String, expiresAt: Date?, email: String?)? {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let path = home.appendingPathComponent(".grok/auth.json")
 
@@ -138,18 +150,42 @@ struct GrokService: UsageService {
             return nil
         }
 
-        // The file is a map of "issuer::client" -> { "key": "<JWT>", "refresh_token": ..., "expires_at": ... }
+        // The file is a map of "issuer::client" -> { "key": "<JWT>", "refresh_token": ..., "expires_at": ... }.
+        // Stale entries survive `grok login`, so never take the first one dictionary
+        // iteration happens to yield — pick the freshest credential instead.
+        let now = Date()
+        var best: (token: String, expiresAt: Date?, email: String?)?
         for (_, value) in json {
-            guard let entry = value as? [String: Any] else { continue }
-            if let key = entry["key"] as? String, !key.isEmpty {
-                let expiresAt: Date? = (entry["expires_at"] as? String).flatMap {
-                    ISO8601DateFormatter().date(from: $0)
+            guard let entry = value as? [String: Any],
+                  let key = entry["key"] as? String, !key.isEmpty else { continue }
+            // NB: must parse fractional seconds — Grok writes "…T02:06:45.801970Z",
+            // which a non-fractional ISO8601DateFormatter rejects (the old code's
+            // bug: expiry always parsed nil, so proactive re-read never fired).
+            let expiresAt = (entry["expires_at"] as? String).flatMap(TimeFormatter.parseISO8601)
+            let email = entry["email"] as? String
+            if let current = best {
+                if Self.isEntryPreferred(expiresAt, over: current.expiresAt, now: now) {
+                    best = (key, expiresAt, email)
                 }
-                return (key, expiresAt)
+            } else {
+                best = (key, expiresAt, email)
             }
         }
+        return best
+    }
 
-        return nil
+    /// Ranking: any non-expired entry beats an expired one (no expiry counts as
+    /// non-expired); within the same group a known, later expiry wins.
+    /// Shared with GrokTokenRefresher so read and refresh pick the same entry.
+    static func isEntryPreferred(_ candidate: Date?, over current: Date?, now: Date) -> Bool {
+        let candidateValid = candidate.map { $0 > now } ?? true
+        let currentValid = current.map { $0 > now } ?? true
+        if candidateValid != currentValid { return candidateValid }
+        switch (candidate, current) {
+        case let (c?, k?): return c > k
+        case (.some, nil): return true
+        default: return false
+        }
     }
 
     // MARK: - Response Parsing

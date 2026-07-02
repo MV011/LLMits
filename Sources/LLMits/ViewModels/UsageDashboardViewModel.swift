@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import SwiftUI
 
@@ -7,6 +8,9 @@ struct AccountUsageData: Identifiable {
     var groups: [UsageGroup]
     var isLoading: Bool
     var error: String?
+    /// Identity (email/user id) the live credential belongs to — may differ
+    /// from the account's stored display name after a CLI account switch.
+    var identity: String?
 }
 
 @MainActor
@@ -16,6 +20,10 @@ class UsageDashboardViewModel: ObservableObject {
     @Published var lastRefreshed: Date?
 
     private var refreshTimer: Timer?
+    private var credentialWatcher: CredentialWatcher?
+    private var wakeObserver: NSObjectProtocol?
+    private var errorRetryTask: Task<Void, Never>?
+    private var errorRetryCount = 0
 
     private func service(for provider: Provider, antigravityServers: [AntigravityServerInfo] = []) -> UsageService {
         switch provider {
@@ -49,7 +57,8 @@ class UsageDashboardViewModel: ObservableObject {
                     account: account,
                     groups: existing.groups,
                     isLoading: force || existing.groups.isEmpty,
-                    error: nil
+                    error: nil,
+                    identity: existing.identity
                 )
             }
             return AccountUsageData(
@@ -57,7 +66,8 @@ class UsageDashboardViewModel: ObservableObject {
                 account: account,
                 groups: [],
                 isLoading: true,
-                error: nil
+                error: nil,
+                identity: nil
             )
         }
 
@@ -114,27 +124,29 @@ class UsageDashboardViewModel: ObservableObject {
 
             // Fetch all in parallel
             debugLog("[Dashboard] starting task group with \(tasks.count) tasks")
-            await withTaskGroup(of: (UUID, [UsageGroup]?, String?).self) { group in
+            await withTaskGroup(of: (UUID, [UsageGroup]?, String?, String?).self) { group in
                 for (accountId, svc, token) in tasks {
                     group.addTask { @Sendable in
                         debugLog("[Dashboard] task started for \(accountId)")
+                        let identity = await svc.currentIdentity()
                         do {
                             let groups = try await svc.fetchUsage(token: token)
                             debugLog("[Dashboard] task completed for \(accountId) with \(groups.count) groups")
-                            return (accountId, groups, nil)
+                            return (accountId, groups, nil, identity)
                         } catch {
                             debugLog("[Dashboard] task FAILED for \(accountId): \(error)")
-                            return (accountId, nil, error.localizedDescription)
+                            return (accountId, nil, error.localizedDescription, identity)
                         }
                     }
                 }
 
-                for await (accountId, groups, error) in group {
+                for await (accountId, groups, error, identity) in group {
                     debugLog("[Dashboard] received result for \(accountId)")
                     if let idx = self.accountUsages.firstIndex(where: { $0.id == accountId }) {
                         self.accountUsages[idx].groups = groups ?? []
                         self.accountUsages[idx].isLoading = false
                         self.accountUsages[idx].error = error
+                        self.accountUsages[idx].identity = identity
                     }
                 }
             }
@@ -146,6 +158,28 @@ class UsageDashboardViewModel: ObservableObject {
                 debugLog("[Dashboard]   provider=\(item.provider.rawValue) usages=\(item.usages.count) groups=\(item.usages.flatMap(\.groups).count) loading=\(item.usages.map(\.isLoading))")
             }
             lastRefreshed = Date()
+            scheduleErrorRetryIfNeeded()
+        }
+    }
+
+    /// After a refresh that left accounts in an error state, retry sooner than the
+    /// 10-minute timer — with exponential backoff (60s → 600s cap) so a persistent
+    /// failure never hammers anything. Resets once a refresh comes back clean.
+    private func scheduleErrorRetryIfNeeded() {
+        errorRetryTask?.cancel()
+        guard accountUsages.contains(where: { $0.error != nil }) else {
+            errorRetryCount = 0
+            return
+        }
+
+        let delay = min(60.0 * pow(2.0, Double(errorRetryCount)), 600.0)
+        errorRetryCount += 1
+        debugLog("[Dashboard] \(accountUsages.filter { $0.error != nil }.count) account(s) in error, retrying in \(Int(delay))s")
+
+        errorRetryTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard !Task.isCancelled, let self else { return }
+            self.refreshAll(accounts: self.latestAccounts)
         }
     }
 
@@ -156,6 +190,8 @@ class UsageDashboardViewModel: ObservableObject {
             refreshAll(accounts: accounts)
         }
         startPeriodicRefresh()
+        startCredentialWatcher()
+        startWakeObserver()
     }
 
     private func startPeriodicRefresh() {
@@ -168,9 +204,53 @@ class UsageDashboardViewModel: ObservableObject {
         }
     }
 
+    /// Refresh as soon as a CLI credential changes on disk (login, logout,
+    /// account switch, token rotation) instead of waiting for the timer.
+    /// While the popover is closed (auto-refresh stopped) nothing is fetched —
+    /// the data is just marked stale so reopening refreshes immediately.
+    private func startCredentialWatcher() {
+        guard credentialWatcher == nil else { return }
+        let watcher = CredentialWatcher { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                if self.refreshTimer != nil {
+                    self.refreshAll(accounts: self.latestAccounts)
+                } else {
+                    self.lastRefreshed = nil
+                }
+            }
+        }
+        watcher.start()
+        credentialWatcher = watcher
+    }
+
+    /// Refresh stale data when the Mac wakes from sleep — the 10-minute timer
+    /// doesn't fire while asleep, so without this the popover shows old numbers
+    /// (and possibly expired-credential errors) right when the user comes back.
+    private func startWakeObserver() {
+        guard wakeObserver == nil else { return }
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.refreshTimer != nil else { return }
+                let isStale = self.lastRefreshed.map { Date().timeIntervalSince($0) > 60 } ?? true
+                if isStale {
+                    debugLog("[Dashboard] system woke, refreshing stale data")
+                    self.refreshAll(accounts: self.latestAccounts)
+                }
+            }
+        }
+    }
+
     func stopAutoRefresh() {
         refreshTimer?.invalidate()
         refreshTimer = nil
+        errorRetryTask?.cancel()
+        errorRetryTask = nil
+        // The credential watcher and wake observer intentionally stay alive —
+        // they make no network requests while auto-refresh is stopped, they only
+        // invalidate `lastRefreshed` so the next popover open refreshes at once.
     }
 
     var usagesByProvider: [(provider: Provider, usages: [AccountUsageData])] {

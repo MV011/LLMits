@@ -62,6 +62,24 @@ struct AnthropicService: UsageService {
         }
     }
 
+    /// The email of the account Claude Code is currently logged into,
+    /// from ~/.claude.json → oauthAccount.emailAddress. Local read only.
+    func currentIdentity() async -> String? {
+        await withCheckedContinuation { cont in
+            DispatchQueue.global(qos: .utility).async {
+                let home = FileManager.default.homeDirectoryForCurrentUser
+                let path = home.appendingPathComponent(".claude.json")
+                guard let data = try? Data(contentsOf: path),
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let account = json["oauthAccount"] as? [String: Any] else {
+                    cont.resume(returning: nil)
+                    return
+                }
+                cont.resume(returning: account["emailAddress"] as? String)
+            }
+        }
+    }
+
     // MARK: - Networking
 
     private func makeRequest(accessToken: String) async throws -> (Data, HTTPURLResponse) {
@@ -87,17 +105,28 @@ struct AnthropicService: UsageService {
 
         var groups: [UsageGroup] = []
 
-        let windows: [(key: String, name: String, type: UsageLimit.WindowType)] = [
-            ("five_hour", "5-Hour Session", .fiveHour),
-            ("seven_day", "Weekly Overall", .weekly),
-            ("seven_day_opus", "Weekly — Opus", .weekly),
-            ("seven_day_sonnet", "Weekly — Sonnet", .weekly),
-        ]
+        // Preferred: the generic `limits` array. Each entry carries its own
+        // kind/group/scope (including per-model weekly limits like Fable or
+        // Opus via scope.model.display_name), so new models show up without
+        // code changes — unlike the legacy fixed key list below.
+        if let limitsArray = json["limits"] as? [[String: Any]] {
+            groups += parseLimitsArray(limitsArray)
+        }
 
-        for (key, name, windowType) in windows {
-            if let window = json[key] as? [String: Any],
-               let limit = parseWindow(window, name: name, windowType: windowType) {
-                groups.append(UsageGroup(name: name, limits: [limit]))
+        // Legacy fallback: fixed per-window keys (older API responses).
+        if groups.isEmpty {
+            let windows: [(key: String, name: String, type: UsageLimit.WindowType)] = [
+                ("five_hour", "5-Hour Session", .fiveHour),
+                ("seven_day", "Weekly Overall", .weekly),
+                ("seven_day_opus", "Weekly — Opus", .weekly),
+                ("seven_day_sonnet", "Weekly — Sonnet", .weekly),
+            ]
+
+            for (key, name, windowType) in windows {
+                if let window = json[key] as? [String: Any],
+                   let limit = parseWindow(window, name: name, windowType: windowType) {
+                    groups.append(UsageGroup(name: name, limits: [limit]))
+                }
             }
         }
 
@@ -125,6 +154,48 @@ struct AnthropicService: UsageService {
         if groups.isEmpty {
             groups.append(UsageGroup(name: "Claude Usage", limits: [
                 UsageLimit(name: "Connected", percentUsed: 0, detail: "No usage data available", windowType: .unknown)
+            ]))
+        }
+
+        return groups
+    }
+
+    /// Parses the modern `limits` array. Example entry:
+    /// { "kind": "weekly_scoped", "group": "weekly", "percent": 5,
+    ///   "resets_at": "…", "scope": { "model": { "display_name": "Fable" } } }
+    private func parseLimitsArray(_ limits: [[String: Any]]) -> [UsageGroup] {
+        var groups: [UsageGroup] = []
+
+        for entry in limits {
+            guard let kind = entry["kind"] as? String else { continue }
+            let isWeekly = (entry["group"] as? String) == "weekly" || kind.hasPrefix("weekly")
+            let windowType: UsageLimit.WindowType = isWeekly ? .weekly : .fiveHour
+
+            let name: String
+            switch kind {
+            case "session":
+                name = "5-Hour Session"
+            case "weekly_all":
+                name = "Weekly Overall"
+            case "weekly_scoped":
+                let scope = entry["scope"] as? [String: Any]
+                let model = (scope?["model"] as? [String: Any])?["display_name"] as? String
+                let surface = (scope?["surface"] as? [String: Any])?["display_name"] as? String
+                name = (model ?? surface).map { "Weekly — \($0)" } ?? "Weekly — Scoped"
+            default:
+                name = kind.replacingOccurrences(of: "_", with: " ").capitalized
+            }
+
+            let percent = (entry["percent"] as? Double) ?? (entry["percent"] as? Int).map(Double.init) ?? 0
+            let windowSeconds = isWeekly ? TimeFormatter.weeklySeconds : TimeFormatter.fiveHourSeconds
+            let (adjusted, detail) = TimeFormatter.adjustForStaleReset(
+                percentUsed: percent / 100.0,
+                resetDateString: entry["resets_at"] as? String,
+                windowSeconds: windowSeconds
+            )
+
+            groups.append(UsageGroup(name: name, limits: [
+                UsageLimit(name: name, percentUsed: adjusted, detail: detail, windowType: windowType)
             ]))
         }
 

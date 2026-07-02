@@ -39,6 +39,7 @@ struct OpenAIService: UsageService {
             // Token might be stale — retry ONCE with fresh read from auth.json
             debugLog("[OpenAI] got auth error, retrying with fresh credentials")
             TokenCache.shared.remove(Self.providerKey)
+            TokenCache.shared.removeObject(Self.providerKey + ".expiresAt")
 
             accessToken = try await resolveAccessToken(manualToken: token, forceFresh: true)
 
@@ -73,12 +74,26 @@ struct OpenAIService: UsageService {
 
         if !forceFresh {
             if let cached = TokenCache.shared.get(Self.providerKey) {
-                return cached
+                if let exp: Date = TokenCache.shared.getObject(Self.providerKey + ".expiresAt") {
+                    let buffer: TimeInterval = 5 * 60  // 5 minutes safety margin
+                    if exp.timeIntervalSinceNow > buffer {
+                        return cached
+                    }
+                    debugLog("[OpenAI] cached token expiring soon (at \(exp)), will re-read auth.json")
+                    // fall through to fresh read from file
+                } else {
+                    return cached
+                }
             }
         }
 
         if let token = loadFromAuthJSON() {
             TokenCache.shared.set(Self.providerKey, value: token)
+            if let exp = JWT.expiry(token) {
+                TokenCache.shared.setObject(Self.providerKey + ".expiresAt", value: exp)
+            } else {
+                TokenCache.shared.removeObject(Self.providerKey + ".expiresAt")
+            }
             return token
         }
 
@@ -86,6 +101,45 @@ struct OpenAIService: UsageService {
     }
 
     private func loadFromAuthJSON() -> String? {
+        guard let json = Self.readAuthJSON() else { return nil }
+
+        if let tokens = json["tokens"] as? [String: Any],
+           let token = tokens["access_token"] as? String ?? tokens["accessToken"] as? String {
+            return token
+        }
+        if let token = json["access_token"] as? String ?? json["accessToken"] as? String {
+            return token
+        }
+        return nil
+    }
+
+    /// The email of the account Codex CLI is logged into, decoded locally from
+    /// the id_token (or access token profile claim) in auth.json. No network.
+    func currentIdentity() async -> String? {
+        await withCheckedContinuation { cont in
+            DispatchQueue.global(qos: .utility).async {
+                guard let json = Self.readAuthJSON(),
+                      let tokens = json["tokens"] as? [String: Any] else {
+                    cont.resume(returning: nil)
+                    return
+                }
+                if let idToken = tokens["id_token"] as? String,
+                   let email = JWT.payload(idToken)?["email"] as? String {
+                    cont.resume(returning: email)
+                    return
+                }
+                if let access = tokens["access_token"] as? String,
+                   let profile = JWT.payload(access)?["https://api.openai.com/profile"] as? [String: Any],
+                   let email = profile["email"] as? String {
+                    cont.resume(returning: email)
+                    return
+                }
+                cont.resume(returning: nil)
+            }
+        }
+    }
+
+    private static func readAuthJSON() -> [String: Any]? {
         let home = FileManager.default.homeDirectoryForCurrentUser
         var paths = [URL]()
         if let codexHome = ProcessInfo.processInfo.environment["CODEX_HOME"] {
@@ -94,17 +148,9 @@ struct OpenAIService: UsageService {
         paths.append(home.appendingPathComponent(".codex/auth.json"))
 
         for path in paths {
-            guard let data = try? Data(contentsOf: path),
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                continue
-            }
-
-            if let tokens = json["tokens"] as? [String: Any],
-               let token = tokens["access_token"] as? String ?? tokens["accessToken"] as? String {
-                return token
-            }
-            if let token = json["access_token"] as? String ?? json["accessToken"] as? String {
-                return token
+            if let data = try? Data(contentsOf: path),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                return json
             }
         }
         return nil
