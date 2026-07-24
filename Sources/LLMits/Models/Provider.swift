@@ -6,6 +6,7 @@ enum Provider: String, Codable, CaseIterable, Identifiable {
     case antigravity
     case cursor
     case grok
+    case kimi
 
     var id: String { rawValue }
 
@@ -16,6 +17,7 @@ enum Provider: String, Codable, CaseIterable, Identifiable {
         case .antigravity: return "Antigravity"
         case .cursor: return "Cursor"
         case .grok: return "xAI (Grok Build)"
+        case .kimi: return "Kimi Code"
         }
     }
 
@@ -52,6 +54,7 @@ enum Provider: String, Codable, CaseIterable, Identifiable {
         case .antigravity: return Color(red: 0.26, green: 0.52, blue: 0.96) // blue
         case .cursor: return Color(red: 0.60, green: 0.40, blue: 0.90)      // purple
         case .grok: return Color(red: 0.0, green: 0.0, blue: 0.0)           // black (xAI)
+        case .kimi: return Color(red: 0.35, green: 0.34, blue: 0.84)        // indigo (Moonshot)
         }
     }
 
@@ -62,13 +65,14 @@ enum Provider: String, Codable, CaseIterable, Identifiable {
         case .antigravity: return "Auto-discovered from ~/.gemini (no token needed)"
         case .cursor: return "Session Token (from cursor.com)"
         case .grok: return "Auto-discovered from ~/.grok/auth.json (Grok Build)"
+        case .kimi: return "Auto-discovered from ~/.kimi-code/credentials (Kimi Code CLI)"
         }
     }
 
     /// Whether this provider auto-discovers credentials (no manual token paste)
     var isAutoDiscovered: Bool {
         switch self {
-        case .antigravity, .grok: return true
+        case .antigravity, .grok, .kimi: return true
         default: return false
         }
     }

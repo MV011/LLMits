@@ -10,7 +10,7 @@ class AccountsViewModel: ObservableObject {
 
     private let accountsKey = "llmits.accounts"
     // Bump the version suffix when new auto-discoverable providers are added
-    private let hasRunAutoDiscoveryKey = "llmits.hasRunAutoDiscovery.v4"
+    private let hasRunAutoDiscoveryKey = "llmits.hasRunAutoDiscovery.v5"
 
     init() {
         loadAccounts()
@@ -28,6 +28,7 @@ class AccountsViewModel: ObservableObject {
             let hasAntigravity = Self.isAntigravityAvailable()
             let hasCursor = CursorService.readCursorJWT() != nil
             let hasGrok = Self.hasGrokCredentials()
+            let hasKimi = Self.hasKimiCredentials()
 
             // Capture weak self before entering MainActor context
             guard let vm = self else { return }
@@ -46,6 +47,9 @@ class AccountsViewModel: ObservableObject {
                 }
                 if hasGrok && vm.accountsFor(provider: .grok).isEmpty {
                     vm.addAccount(provider: .grok, displayName: "Grok Build", token: "mock-token")
+                }
+                if hasKimi && vm.accountsFor(provider: .kimi).isEmpty {
+                    vm.addAccount(provider: .kimi, displayName: "Kimi Code", token: "mock-token")
                 }
             }
         }
@@ -101,6 +105,13 @@ class AccountsViewModel: ObservableObject {
         let home = FileManager.default.homeDirectoryForCurrentUser
         return FileManager.default.fileExists(
             atPath: home.appendingPathComponent(".grok/auth.json").path
+        )
+    }
+
+    nonisolated private static func hasKimiCredentials() -> Bool {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        return FileManager.default.fileExists(
+            atPath: home.appendingPathComponent(".kimi-code/credentials/kimi-code.json").path
         )
     }
 

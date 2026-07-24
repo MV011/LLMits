@@ -15,6 +15,7 @@ A lightweight macOS menu bar app that tracks your AI coding tool usage and limit
 | **Cursor** | Auto-discovered from local SQLite DB | Premium requests, extra usage |
 | **Antigravity** | Auto-discovered from running server | Per-model quotas with 5h reset windows |
 | **xAI (Grok Build)** | Auto-discovered from `~/.grok/auth.json` | Monthly subscription credits (SuperGrok / X Premium+) |
+| **Kimi Code** | Auto-discovered from `~/.kimi-code/credentials` | Weekly quota, rolling 5-hour rate window |
 
 ## Features
 
@@ -64,7 +65,19 @@ LLMits automatically finds your credentials — no manual setup required:
 - **Cursor** — reads JWT from `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb`
 - **Antigravity** — discovers running language server processes via `ps`
 - **Grok Build** — reads OAuth session from `~/.grok/auth.json`
-- **Grok Build** — reads session token from `~/.grok/auth.json` (after `grok login`)
+- **Kimi Code** — reads OAuth token from `~/.kimi-code/credentials/kimi-code.json`
+
+### Local Code Signing
+
+`build.sh` signs the app with a self-signed **"LLMits Local Signing"** certificate
+(created automatically in your login keychain by `scripts/create-signing-identity.sh`,
+no Apple Developer account needed). A stable signing identity lets macOS persist
+Keychain **"Always Allow"** grants across rebuilds — with ad-hoc signing, macOS
+asks for the keychain password on every Claude credential read instead.
+
+The first launch after the identity is created (or after Claude re-creates its
+keychain item on re-login) shows one "Always Allow" prompt — click it once and
+you won't be asked for a password again.
 
 ### Manual Token Entry
 
@@ -73,7 +86,7 @@ If auto-discovery doesn't work, click **"+ Add Account"** in the popover to manu
 ## Project Structure
 
 ```
-Sources/Perihelion/
+Sources/LLMits/
 ├── App/                    # App entry point (LLMitsApp)
 ├── Models/                 # Data models (Account, Provider, UsageLimit)
 ├── Views/                  # SwiftUI views (MenuBarPopover, ProviderSection)
@@ -84,6 +97,7 @@ Sources/Perihelion/
 │   ├── CursorService.swift       # Cursor SQLite + cookie auth
 │   ├── AntigravityService.swift  # Local server discovery + quota API
 │   ├── GrokService.swift         # Grok Build auth.json + billing API
+│   ├── KimiService.swift         # Kimi Code credentials + usages API
 │   ├── KeychainManager.swift     # File-based token storage
 │   ├── TokenCache.swift          # In-memory credential cache
 │   └── TimeFormatter.swift       # Reset countdown formatting

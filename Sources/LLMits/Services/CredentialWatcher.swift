@@ -42,6 +42,7 @@ final class CredentialWatcher {
             home.appendingPathComponent(".grok"),                  // Grok CLI auth.json
             home.appendingPathComponent(".codex"),                 // Codex CLI auth.json
             home.appendingPathComponent(".gemini"),                // Gemini/Antigravity oauth_creds.json
+            home.appendingPathComponent(".kimi-code/credentials"), // Kimi Code kimi-code.json
             home.appendingPathComponent(
                 "Library/Application Support/Cursor/User/globalStorage"  // Cursor state.vscdb
             ),
@@ -127,6 +128,7 @@ final class CredentialWatcher {
             ".gemini/google_accounts.json",
             ".claude/.credentials.json",
             ".claude/credentials.json",
+            ".kimi-code/credentials/kimi-code.json",
         ]
         for rel in credentialFiles {
             let path = home.appendingPathComponent(rel).path

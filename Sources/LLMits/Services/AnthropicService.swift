@@ -250,6 +250,13 @@ actor TokenResolver {
     private let minReadInterval: TimeInterval = 5 // seconds
     private var lastReadTime: Date?
 
+    /// After a failed/cancelled Keychain read, don't touch the Keychain again
+    /// for this long — otherwise every timer tick re-triggers the interactive
+    /// prompt. Cleared by invalidateCache() (e.g. credential-watcher events),
+    /// so real logins are picked up immediately.
+    private let failureCooldown: TimeInterval = 5 * 60
+    private var lastFailure: Date?
+
     private init() {}
 
     /// Resolve the access token. Uses cache if valid, otherwise reads from Keychain/file.
@@ -273,9 +280,12 @@ actor TokenResolver {
     }
 
     /// Clear the cache, forcing a fresh Keychain/file read on next resolve().
+    /// Also clears the failure cooldown so credential-watcher events and 401
+    /// retries always get a real read.
     func invalidateCache() {
         debugLog("[TokenResolver] cache invalidated")
         cached = nil
+        lastFailure = nil
     }
 
     /// Read fresh credentials from Keychain (primary) or credentials files (fallback).
@@ -292,10 +302,20 @@ actor TokenResolver {
             return c.accessToken
         }
 
-        debugLog("[TokenResolver] reading fresh credentials from Keychain/file")
-        guard let creds = await Self.loadCredentialsAsync() else {
+        // Cooldown after a failed/cancelled read — without it, every timer tick
+        // re-triggers the interactive Keychain prompt.
+        if let failed = lastFailure,
+           Date().timeIntervalSince(failed) < failureCooldown {
+            debugLog("[TokenResolver] in failure cooldown, skipping Keychain read")
             throw ServiceError.noCredentials("Install Claude Code CLI and run 'claude' to login, or paste an OAuth token manually.")
         }
+
+        debugLog("[TokenResolver] reading fresh credentials from Keychain/file")
+        guard let creds = await Self.loadCredentialsAsync() else {
+            lastFailure = Date()
+            throw ServiceError.noCredentials("Install Claude Code CLI and run 'claude' to login, or paste an OAuth token manually.")
+        }
+        lastFailure = nil
 
         cached = CachedCredentials(
             accessToken: creds.accessToken,

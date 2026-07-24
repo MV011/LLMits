@@ -36,6 +36,20 @@ final class TokenCache {
         objectCache.removeValue(forKey: key)
     }
 
+    /// File-backed provider credential keys cached here (token + `.expiresAt`
+    /// object). Anthropic is intentionally absent — it lives in TokenResolver.
+    private static let providerKeys = ["openai", "grok", "kimi"]
+
+    /// Drop every cached provider credential. Called when the CredentialWatcher
+    /// detects a login/account switch/token rotation so the next fetch re-reads
+    /// from disk instead of serving the old account's (still-valid) token.
+    func invalidateAllProviders() {
+        for key in Self.providerKeys {
+            remove(key)
+            removeObject(key + ".expiresAt")
+        }
+    }
+
     func getObject<T>(_ key: String) -> T? {
         lock.lock()
         defer { lock.unlock() }

@@ -32,6 +32,7 @@ class UsageDashboardViewModel: ObservableObject {
         case .antigravity: return AntigravityService(cachedServers: antigravityServers)
         case .cursor: return CursorService()
         case .grok: return GrokService()
+        case .kimi: return KimiService()
         }
     }
 
@@ -213,6 +214,12 @@ class UsageDashboardViewModel: ObservableObject {
         let watcher = CredentialWatcher { [weak self] in
             Task { @MainActor in
                 guard let self else { return }
+                // A CLI credential changed (login, account switch, token
+                // rotation) — drop all cached tokens first, otherwise a
+                // still-valid cached token keeps serving the OLD account's
+                // data while the identity line already shows the new one.
+                await TokenResolver.shared.invalidateCache()
+                TokenCache.shared.invalidateAllProviders()
                 if self.refreshTimer != nil {
                     self.refreshAll(accounts: self.latestAccounts)
                 } else {
