@@ -154,12 +154,17 @@ struct KimiService: UsageService {
 
         var groups: [UsageGroup] = []
 
-        // Rolling rate-limit windows (currently a single 300-minute = 5h window)
+        // Rolling rate-limit windows (currently a single 300-minute = 5h window).
+        // The API omits zero-valued fields proto3-style — "used" disappears
+        // entirely when the window is unused — so derive missing values
+        // instead of dropping the group.
         if let limits = json["limits"] as? [[String: Any]] {
             for entry in limits {
                 guard let detail = entry["detail"] as? [String: Any],
-                      let limit = Self.parseNumber(detail["limit"]), limit > 0,
-                      let used = Self.parseNumber(detail["used"]) else { continue }
+                      let limit = Self.parseNumber(detail["limit"]), limit > 0 else { continue }
+                let used = Self.parseNumber(detail["used"])
+                    ?? Self.parseNumber(detail["remaining"]).map { max(limit - $0, 0) }
+                    ?? 0
 
                 let window = entry["window"] as? [String: Any]
                 let windowSeconds = Self.windowDurationSeconds(window)
@@ -178,10 +183,13 @@ struct KimiService: UsageService {
             }
         }
 
-        // Weekly subscription quota
+        // Weekly subscription quota (same zero-omission handling: "remaining"
+        // disappears at 0, "used" disappears at 0)
         if let usage = json["usage"] as? [String: Any],
-           let limit = Self.parseNumber(usage["limit"]), limit > 0,
-           let remaining = Self.parseNumber(usage["remaining"]) {
+           let limit = Self.parseNumber(usage["limit"]), limit > 0 {
+            let remaining = Self.parseNumber(usage["remaining"])
+                ?? Self.parseNumber(usage["used"]).map { max(limit - $0, 0) }
+                ?? 0
             let resetText = (usage["resetTime"] as? String)
                 .flatMap(TimeFormatter.formatResetTime(isoString:))
             groups.append(UsageGroup(name: "Kimi — Weekly", limits: [
