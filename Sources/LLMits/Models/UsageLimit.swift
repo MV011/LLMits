@@ -2,7 +2,9 @@ import Foundation
 import SwiftUI
 
 struct UsageLimit: Identifiable {
-    let id = UUID()
+    // Stable, content-derived id (names are unique within a group) so
+    // SwiftUI doesn't rebuild the whole list subtree on every refresh.
+    var id: String { name }
     let name: String
     let percentUsed: Double        // 0.0 – 1.0
     let detail: String?            // e.g. "Resets in 2h 34m"

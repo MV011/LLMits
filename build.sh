@@ -1,5 +1,6 @@
 #!/bin/bash
 set -euo pipefail
+cd "$(dirname "$0")"
 
 # Build LLMits as a .app bundle
 # Usage: ./build.sh [--release] [--install]

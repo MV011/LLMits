@@ -11,6 +11,12 @@ class AccountsViewModel: ObservableObject {
     private let accountsKey = "llmits.accounts"
     // Bump the version suffix when new auto-discoverable providers are added
     private let hasRunAutoDiscoveryKey = "llmits.hasRunAutoDiscovery.v5"
+    // Providers the user explicitly deleted — auto-discovery must not resurrect them
+    private let tombstonedProvidersKey = "llmits.tombstonedProviders"
+
+    private var tombstonedProviders: Set<String> {
+        Set(UserDefaults.standard.stringArray(forKey: tombstonedProvidersKey) ?? [])
+    }
 
     init() {
         loadAccounts()
@@ -20,7 +26,6 @@ class AccountsViewModel: ObservableObject {
     /// Must be called explicitly (not from init) to avoid blocking the main thread.
     func runAutoDiscoveryIfNeeded() {
         guard !UserDefaults.standard.bool(forKey: hasRunAutoDiscoveryKey) else { return }
-        UserDefaults.standard.set(true, forKey: hasRunAutoDiscoveryKey)
 
         Task.detached { [weak self] in
             let hasClaude = Self.hasClaudeCodeCredentials()
@@ -33,22 +38,26 @@ class AccountsViewModel: ObservableObject {
             // Capture weak self before entering MainActor context
             guard let vm = self else { return }
             await MainActor.run {
-                if hasClaude && vm.accountsFor(provider: .anthropic).isEmpty {
+                // Mark as run only now that the checks completed — setting the
+                // flag up front means a quit in between skips discovery forever.
+                UserDefaults.standard.set(true, forKey: vm.hasRunAutoDiscoveryKey)
+                let tombstoned = vm.tombstonedProviders
+                if hasClaude && !tombstoned.contains(Provider.anthropic.rawValue) && vm.accountsFor(provider: .anthropic).isEmpty {
                     vm.addAccount(provider: .anthropic, displayName: "Claude Code", token: "mock-token")
                 }
-                if hasCodex && vm.accountsFor(provider: .openai).isEmpty {
+                if hasCodex && !tombstoned.contains(Provider.openai.rawValue) && vm.accountsFor(provider: .openai).isEmpty {
                     vm.addAccount(provider: .openai, displayName: "Codex CLI", token: "mock-token")
                 }
-                if hasAntigravity && vm.accountsFor(provider: .antigravity).isEmpty {
+                if hasAntigravity && !tombstoned.contains(Provider.antigravity.rawValue) && vm.accountsFor(provider: .antigravity).isEmpty {
                     vm.addAccount(provider: .antigravity, displayName: "Antigravity", token: "mock-token")
                 }
-                if hasCursor && vm.accountsFor(provider: .cursor).isEmpty {
+                if hasCursor && !tombstoned.contains(Provider.cursor.rawValue) && vm.accountsFor(provider: .cursor).isEmpty {
                     vm.addAccount(provider: .cursor, displayName: "Cursor", token: "mock-token")
                 }
-                if hasGrok && vm.accountsFor(provider: .grok).isEmpty {
+                if hasGrok && !tombstoned.contains(Provider.grok.rawValue) && vm.accountsFor(provider: .grok).isEmpty {
                     vm.addAccount(provider: .grok, displayName: "Grok Build", token: "mock-token")
                 }
-                if hasKimi && vm.accountsFor(provider: .kimi).isEmpty {
+                if hasKimi && !tombstoned.contains(Provider.kimi.rawValue) && vm.accountsFor(provider: .kimi).isEmpty {
                     vm.addAccount(provider: .kimi, displayName: "Kimi Code", token: "mock-token")
                 }
             }
@@ -56,6 +65,11 @@ class AccountsViewModel: ObservableObject {
     }
 
     func addAccount(provider: Provider, displayName: String, token: String) {
+        // Auto-discovered providers read the same on-disk credentials —
+        // a second account for the same provider would be a duplicate.
+        if provider.isAutoDiscovered && !accountsFor(provider: provider).isEmpty {
+            return
+        }
         let account = Account(provider: provider, displayName: displayName)
         try? KeychainManager.save(key: account.tokenKeychainKey, value: token)
         accounts.append(account)
@@ -64,10 +78,11 @@ class AccountsViewModel: ObservableObject {
     func removeAccount(_ account: Account) {
         KeychainManager.delete(key: account.tokenKeychainKey)
         accounts.removeAll(where: { $0.id == account.id })
-    }
-
-    func updateToken(for account: Account, newToken: String) {
-        try? KeychainManager.save(key: account.tokenKeychainKey, value: newToken)
+        // Tombstone the provider so a later auto-discovery (e.g. after the
+        // discovery-version key is bumped) doesn't resurrect the account.
+        var tombstoned = tombstonedProviders
+        tombstoned.insert(account.provider.rawValue)
+        UserDefaults.standard.set(Array(tombstoned), forKey: tombstonedProvidersKey)
     }
 
     func accountsFor(provider: Provider) -> [Account] {
@@ -130,15 +145,18 @@ class AccountsViewModel: ObservableObject {
             executable: "/bin/ps",
             arguments: ["-ax", "-o", "command="]
         ) else { return false }
-        // Detect desktop app language server
-        if output.contains("language_server") && output.contains("antigravity") {
-            return true
+        // Match per line — a substring match on the whole output would hit any
+        // process whose command line merely contains the letters "agy".
+        return output.split(separator: "\n").contains { line in
+            let command = line.trimmingCharacters(in: .whitespaces)
+            // Detect desktop app language server
+            if command.contains("language_server") && command.contains("antigravity") {
+                return true
+            }
+            // Detect agy CLI: the executable's basename must be exactly "agy"
+            let executable = command.split(separator: " ", maxSplits: 1).first.map(String.init) ?? ""
+            return (executable as NSString).lastPathComponent == "agy"
         }
-        // Detect agy CLI process
-        if output.contains("agy") {
-            return true
-        }
-        return false
     }
 
     // MARK: - Persistence

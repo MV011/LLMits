@@ -17,9 +17,18 @@ import Foundation
 /// which breaks per-file vnode watching, so containing directories are watched.
 final class CredentialWatcher {
     private var sources: [DispatchSourceFileSystemObject] = []
+    /// Paths of directories with a live dispatch source — used to pick up
+    /// directories that only appear later (e.g. ~/.grok on first login).
+    private var watchedPaths: Set<String> = []
     private var debounceWorkItem: DispatchWorkItem?
     private var lastFingerprint: String?
     private var lastFired: Date?
+    /// Memoized heavy fingerprint parts, keyed by file mtime+size — stat is
+    /// cheap, parsing a multi-MB JSON / spawning sqlite3 is not.
+    private var lastClaudeConfigStamp: (mtime: TimeInterval, size: Int)?
+    private var lastClaudeIdentity: String?
+    private var lastCursorDBStamp: (mtime: TimeInterval, size: Int)?
+    private var lastCursorIdentity: String?
     private let queue = DispatchQueue(label: "llmits.credential-watcher", qos: .utility)
     private let onChange: () -> Void
 
@@ -53,35 +62,50 @@ final class CredentialWatcher {
         guard sources.isEmpty else { return }
 
         queue.async { [weak self] in
-            self?.lastFingerprint = Self.credentialFingerprint()
+            guard let self else { return }
+            self.lastFingerprint = self.credentialFingerprint()
         }
 
         for dir in Self.watchDirectories {
-            let fd = open(dir.path, O_EVTONLY)
-            guard fd >= 0 else { continue }
-
-            let source = DispatchSource.makeFileSystemObjectSource(
-                fileDescriptor: fd,
-                eventMask: [.write, .rename, .delete],
-                queue: queue
-            )
-            source.setEventHandler { [weak self] in
-                self?.scheduleCheck()
-            }
-            source.setCancelHandler {
-                close(fd)
-            }
-            source.resume()
-            sources.append(source)
-            debugLog("[CredentialWatcher] watching \(dir.path)")
+            watchDirectory(dir)
         }
     }
 
     func stop() {
         sources.forEach { $0.cancel() }
         sources.removeAll()
+        watchedPaths.removeAll()
         debounceWorkItem?.cancel()
         debounceWorkItem = nil
+    }
+
+    private func watchDirectory(_ dir: URL) {
+        let fd = open(dir.path, O_EVTONLY)
+        guard fd >= 0 else { return }
+
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd,
+            eventMask: [.write, .rename, .delete],
+            queue: queue
+        )
+        source.setEventHandler { [weak self] in
+            self?.scheduleCheck()
+        }
+        source.setCancelHandler {
+            close(fd)
+        }
+        source.resume()
+        sources.append(source)
+        watchedPaths.insert(dir.path)
+        debugLog("[CredentialWatcher] watching \(dir.path)")
+    }
+
+    /// Directories that didn't exist at start() (e.g. ~/.grok before the
+    /// first Grok login) get picked up here — open() is cheap.
+    private func watchNewDirectories() {
+        for dir in Self.watchDirectories where !watchedPaths.contains(dir.path) {
+            watchDirectory(dir)
+        }
     }
 
     private func scheduleCheck() {
@@ -103,7 +127,9 @@ final class CredentialWatcher {
     }
 
     private func checkForCredentialChange() {
-        let fingerprint = Self.credentialFingerprint()
+        // Pick up credential directories that appeared since the last check.
+        watchNewDirectories()
+        let fingerprint = credentialFingerprint()
         guard fingerprint != lastFingerprint else { return }
         lastFingerprint = fingerprint
         lastFired = Date()
@@ -115,7 +141,7 @@ final class CredentialWatcher {
 
     /// Compact per-process snapshot of the credential state across providers.
     /// Only compared for equality — never persisted, never logged.
-    private static func credentialFingerprint() -> String {
+    private func credentialFingerprint() -> String {
         let home = FileManager.default.homeDirectoryForCurrentUser
         var parts: [String] = []
 
@@ -142,22 +168,59 @@ final class CredentialWatcher {
         // Claude Code on macOS keeps its OAuth credential in the Keychain (no
         // file to stat) — the visible account-switch signal is oauthAccount in
         // ~/.claude.json. That file churns for other reasons, so extract just
-        // the account identity rather than using its mtime.
+        // the account identity rather than using its mtime. The parse is
+        // multi-MB, so skip it while mtime+size match the last check.
         let claudeConfig = home.appendingPathComponent(".claude.json")
-        if let data = try? Data(contentsOf: claudeConfig),
-           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let account = json["oauthAccount"] as? [String: Any] {
-            let identity = (account["emailAddress"] as? String)
-                ?? (account["accountUuid"] as? String)
-                ?? ""
-            parts.append("claude:\(identity)")
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: claudeConfig.path) {
+            let stamp = (mtime: (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0,
+                         size: (attrs[.size] as? NSNumber)?.intValue ?? 0)
+            if let last = lastClaudeConfigStamp, last.mtime == stamp.mtime, last.size == stamp.size {
+                if let identity = lastClaudeIdentity {
+                    parts.append("claude:\(identity)")
+                }
+            } else {
+                lastClaudeConfigStamp = stamp
+                lastClaudeIdentity = nil
+                if let data = try? Data(contentsOf: claudeConfig),
+                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let account = json["oauthAccount"] as? [String: Any] {
+                    let identity = (account["emailAddress"] as? String)
+                        ?? (account["accountUuid"] as? String)
+                        ?? ""
+                    parts.append("claude:\(identity)")
+                    lastClaudeIdentity = identity
+                }
+            }
+        } else {
+            lastClaudeConfigStamp = nil
+            lastClaudeIdentity = nil
         }
 
         // Cursor's state.vscdb changes constantly while the IDE runs — only
-        // the auth tokens inside it matter. hashValue is stable within a
+        // the auth tokens inside it matter, so don't spawn sqlite3 while
+        // mtime+size match the last check. hashValue is stable within a
         // process run, which is all an equality check needs.
-        if let (userId, jwt) = CursorService.readAuthTokensSync() {
-            parts.append("cursor:\(userId):\(jwt.hashValue)")
+        let cursorDB = home.appendingPathComponent(
+            "Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: cursorDB.path) {
+            let stamp = (mtime: (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0,
+                         size: (attrs[.size] as? NSNumber)?.intValue ?? 0)
+            if let last = lastCursorDBStamp, last.mtime == stamp.mtime, last.size == stamp.size {
+                if let identity = lastCursorIdentity {
+                    parts.append(identity)
+                }
+            } else {
+                lastCursorDBStamp = stamp
+                lastCursorIdentity = nil
+                if let (userId, jwt) = CursorService.readAuthTokensSync() {
+                    let identity = "cursor:\(userId):\(jwt.hashValue)"
+                    parts.append(identity)
+                    lastCursorIdentity = identity
+                }
+            }
+        } else {
+            lastCursorDBStamp = nil
+            lastCursorIdentity = nil
         }
 
         return parts.joined(separator: "|")

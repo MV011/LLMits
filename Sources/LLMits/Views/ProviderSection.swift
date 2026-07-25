@@ -210,7 +210,8 @@ struct ProviderSection: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .center)
                 .padding(.vertical, 8)
-            } else if let error = usage.error {
+            } else if let error = usage.error, usage.groups.isEmpty {
+                // Full error state — no cached groups to show
                 HStack(spacing: 6) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .font(.system(size: 11))
@@ -235,6 +236,20 @@ struct ProviderSection: View {
                                 .padding(.leading, 4)
                         }
                     }
+                    .padding(.top, 2)
+                }
+
+                // Fetch failed but last-known groups are kept — compact footnote
+                if let error = usage.error {
+                    HStack(spacing: 4) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.orange)
+                        Text(error)
+                            .font(.system(size: 9, design: .rounded))
+                            .foregroundStyle(.tertiary)
+                    }
+                    .padding(.leading, 4)
                     .padding(.top, 2)
                 }
             }

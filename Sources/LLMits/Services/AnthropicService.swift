@@ -246,6 +246,11 @@ actor TokenResolver {
     }
 
     private var cached: CachedCredentials?
+    /// Single-flight guard: concurrent cold resolve() calls (e.g. two Claude
+    /// accounts) share ONE interactive Keychain read instead of each
+    /// triggering their own prompt. Actors are re-entrant, so the cache check
+    /// alone can't serialize this.
+    private var inFlight: Task<String, Error>?
     /// Minimum interval between Keychain reads (prevent hammering on repeated 401s)
     private let minReadInterval: TimeInterval = 5 // seconds
     private var lastReadTime: Date?
@@ -276,7 +281,15 @@ actor TokenResolver {
             debugLog("[TokenResolver] cached token expired, will re-read")
         }
 
-        return try await readFreshCredentials()
+        // Join an already-running read rather than starting a second one
+        if let inFlight {
+            return try await inFlight.value
+        }
+
+        let task = Task { try await self.readFreshCredentials() }
+        inFlight = task
+        defer { inFlight = nil }
+        return try await task.value
     }
 
     /// Clear the cache, forcing a fresh Keychain/file read on next resolve().
@@ -311,8 +324,14 @@ actor TokenResolver {
         }
 
         debugLog("[TokenResolver] reading fresh credentials from Keychain/file")
-        guard let creds = await Self.loadCredentialsAsync() else {
+        let loadResult = await Self.loadCredentialsAsync()
+        guard let creds = loadResult.credentials else {
             lastFailure = Date()
+            if loadResult.keychainStatus == errSecUserCanceled || loadResult.keychainStatus == errSecAuthFailed {
+                // The user denied/cancelled the Keychain prompt — don't tell
+                // them to install the CLI they already have.
+                throw ServiceError.noCredentials("Keychain access to Claude credentials was denied — approve the prompt to continue.")
+            }
             throw ServiceError.noCredentials("Install Claude Code CLI and run 'claude' to login, or paste an OAuth token manually.")
         }
         lastFailure = nil
@@ -342,11 +361,18 @@ actor TokenResolver {
         let expiresAt: Double
     }
 
+    /// Credentials plus the raw Keychain lookup status, so callers can
+    /// distinguish "no credentials stored" from "user denied the prompt".
+    private struct LoadResult {
+        let credentials: FullCredentials?
+        let keychainStatus: OSStatus
+    }
+
     /// Performs the potentially interactive / blocking Keychain lookup off the Swift
     /// concurrency thread pool (and off the main thread) by dispatching to GCD.
     /// This prevents the app from appearing frozen while the user approves the
     /// Keychain permission dialog for "Claude Code-credentials".
-    private static func loadCredentialsAsync() async -> FullCredentials? {
+    private static func loadCredentialsAsync() async -> LoadResult {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 // === Original blocking Keychain + file fallback logic ===
@@ -364,7 +390,7 @@ actor TokenResolver {
                    let jsonStr = String(data: data, encoding: .utf8),
                    let creds = parseCredentials(jsonStr) {
                     debugLog("[TokenResolver] loaded credentials from Keychain")
-                    continuation.resume(returning: creds)
+                    continuation.resume(returning: LoadResult(credentials: creds, keychainStatus: status))
                     return
                 }
 
@@ -382,12 +408,12 @@ actor TokenResolver {
                        let jsonStr = String(data: data, encoding: .utf8),
                        let creds = parseCredentials(jsonStr) {
                         debugLog("[TokenResolver] loaded credentials from \(path.lastPathComponent)")
-                        continuation.resume(returning: creds)
+                        continuation.resume(returning: LoadResult(credentials: creds, keychainStatus: status))
                         return
                     }
                 }
 
-                continuation.resume(returning: nil)
+                continuation.resume(returning: LoadResult(credentials: nil, keychainStatus: status))
             }
         }
     }

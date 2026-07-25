@@ -19,6 +19,22 @@ if security find-identity -v -p codesigning | grep -q "$IDENTITY"; then
     exit 0
 fi
 
+# The cert may exist in the keychain but be untrusted — `find-identity -v`
+# filters untrusted certs out, so the check above misses that case. Re-trust
+# the existing cert instead of generating a duplicate same-named one.
+if security find-certificate -c "$IDENTITY" "$HOME/Library/Keychains/login.keychain-db" >/dev/null 2>&1; then
+    echo "🔐 '$IDENTITY' exists but is not trusted — re-adding code-signing trust..."
+    PEM_FILE=$(mktemp -t llmits-cert)
+    trap 'rm -f "$PEM_FILE"' EXIT
+    security find-certificate -c "$IDENTITY" -p \
+        "$HOME/Library/Keychains/login.keychain-db" > "$PEM_FILE"
+    security add-trusted-cert -p codeSign \
+        -k "$HOME/Library/Keychains/login.keychain-db" \
+        "$PEM_FILE"
+    echo "✅ Re-trusted existing '$IDENTITY', nothing else to do."
+    exit 0
+fi
+
 echo "🔐 Creating self-signed code-signing identity '$IDENTITY'..."
 
 TMP_DIR=$(mktemp -d)
@@ -47,16 +63,22 @@ openssl req -x509 -newkey rsa:2048 -nodes \
     -keyout "$TMP_DIR/key.pem" \
     -out "$TMP_DIR/cert.pem" \
     -days 3650 \
-    -config "$TMP_DIR/openssl.cnf" 2>/dev/null
+    -config "$TMP_DIR/openssl.cnf"
 
 # OpenSSL 3 defaults to AES PKCS12 algorithms that macOS `security import`
 # rejects ("MAC verification failed") — use -legacy and a throwaway password.
-openssl pkcs12 -export -legacy \
+# -legacy is OpenSSL-3-only; stock macOS LibreSSL rejects the flag, and its
+# default PKCS12 export is already compatible, so add it only when needed.
+LEGACY_FLAG=""
+if openssl version | grep -q '^OpenSSL 3'; then
+    LEGACY_FLAG="-legacy"
+fi
+openssl pkcs12 -export $LEGACY_FLAG \
     -name "$IDENTITY" \
     -inkey "$TMP_DIR/key.pem" \
     -in "$TMP_DIR/cert.pem" \
     -out "$TMP_DIR/identity.p12" \
-    -passout pass:llmits-temp 2>/dev/null
+    -passout pass:llmits-temp
 
 # -T /usr/bin/codesign lets codesign use the private key without an ACL prompt.
 security import "$TMP_DIR/identity.p12" \

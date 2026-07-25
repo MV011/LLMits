@@ -61,7 +61,7 @@ enum TimeFormatter {
 
     // MARK: - Formatting
 
-    /// Format seconds remaining as "Resets in Xd Yh Zm", "Resets in Yh Zm", or "Resets in Zm".
+    /// Format seconds remaining as "Resets in Xd Yh Zm", "Resets in Yh Zm", "Resets in Zm", or "Resets in <1m".
     static func formatRemaining(_ seconds: TimeInterval) -> String? {
         guard seconds > 0 else { return nil }
 
@@ -74,8 +74,10 @@ enum TimeFormatter {
             return "Resets in \(days)d \(hours)h \(minutes)m"
         } else if hours > 0 {
             return "Resets in \(hours)h \(minutes)m"
-        } else {
+        } else if minutes > 0 {
             return "Resets in \(minutes)m"
+        } else {
+            return "Resets in <1m"
         }
     }
 

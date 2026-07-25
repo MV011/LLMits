@@ -5,6 +5,9 @@ import Foundation
 func debugLog(_ msg: String) {
     let logPath = "/tmp/llmits_debug.log"
     guard FileManager.default.fileExists(atPath: logPath) else { return }
+    // /tmp is world-writable — never append to a log owned by someone else.
+    guard let attrs = try? FileManager.default.attributesOfItem(atPath: logPath),
+          (attrs[.ownerAccountName] as? String) == NSUserName() else { return }
 
     // Redact sensitive tokens from log output
     let sanitized = redactTokens(msg)
@@ -23,17 +26,19 @@ func debugLog(_ msg: String) {
     }
 }
 
+/// Redaction regexes, compiled once — NSRegularExpression creation is too
+/// expensive to repeat for every log line.
+private enum RedactionPatterns {
+    static let token = try? NSRegularExpression(pattern: #"token=([A-Za-z0-9_\-\.]{10,})"#)
+    static let bearer = try? NSRegularExpression(pattern: #"Bearer ([A-Za-z0-9_\-\.]{10,})"#)
+}
+
 /// Strips token values from log messages, keeping only the first 6 chars.
 private func redactTokens(_ msg: String) -> String {
     var result = msg
 
     // Redact "token=XXX" patterns (keeping first 6 chars)
-    let tokenPatterns = [
-        (try? NSRegularExpression(pattern: #"token=([A-Za-z0-9_\-\.]{10,})"#)),
-        (try? NSRegularExpression(pattern: #"Bearer ([A-Za-z0-9_\-\.]{10,})"#)),
-    ]
-
-    for regex in tokenPatterns.compactMap({ $0 }) {
+    for regex in [RedactionPatterns.token, RedactionPatterns.bearer].compactMap({ $0 }) {
         let range = NSRange(result.startIndex..., in: result)
         let matches = regex.matches(in: result, range: range).reversed()
         for match in matches {

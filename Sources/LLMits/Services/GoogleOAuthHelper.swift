@@ -164,11 +164,21 @@ enum GoogleOAuthHelper {
             return
         }
 
-        do {
-            try updatedData.write(to: credsURL, options: .atomic)
-            debugLog("[GoogleOAuth] persisted refreshed token to disk")
-        } catch {
-            debugLog("[GoogleOAuth] failed to write refreshed token: \(error)")
+        // Retry once on transient failure before giving up.
+        for attempt in 1...2 {
+            do {
+                try updatedData.write(to: credsURL, options: .atomic)
+                // The atomic write recreates the file with default 0644 —
+                // restore the CLI's 0600, this file holds a long-lived
+                // Google refresh token.
+                try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: credsURL.path)
+                debugLog("[GoogleOAuth] persisted refreshed token to disk")
+                return
+            } catch {
+                if attempt == 2 {
+                    debugLog("[GoogleOAuth] failed to write refreshed token: \(error)")
+                }
+            }
         }
     }
 
@@ -184,15 +194,5 @@ enum GoogleOAuthHelper {
             return active
         }
         return "Antigravity"
-    }
-
-    // MARK: - Helpers
-
-    static func parseISO8601(_ str: String) -> Date? {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = formatter.date(from: str) { return d }
-        formatter.formatOptions = [.withInternetDateTime]
-        return formatter.date(from: str)
     }
 }

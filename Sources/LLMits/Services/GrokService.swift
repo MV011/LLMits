@@ -25,7 +25,13 @@ struct GrokService: UsageService {
 
             RateLimiter.shared.clear(Self.providerKey)
             return try parseBillingResponses(credits: creditsData, plain: plainData)
-        } catch ServiceError.noCredentials {
+        } catch ServiceError.noCredentials(let message) {
+            // A pasted manual token can't be refreshed — retrying would just
+            // re-send the identical token, guaranteed to fail.
+            if token != "mock-token" && token != "mock" && !token.isEmpty {
+                throw ServiceError.noCredentials(message)
+            }
+
             // Token might be stale (e.g. Grok CLI refreshed ~/.grok/auth.json while app was running) —
             // retry ONCE with a fresh read from the file (clear cache so resolve will reload).
             debugLog("[Grok] got auth error, retrying with fresh credentials from ~/.grok/auth.json")
@@ -62,7 +68,9 @@ struct GrokService: UsageService {
         case 401, 403:
             throw ServiceError.noCredentials("Grok credentials expired or invalid. Run `grok login` to re-authenticate.")
         case 429:
-            RateLimiter.shared.recordLimit(Self.providerKey)
+            let retryAfterStr = httpResponse.value(forHTTPHeaderField: "Retry-After")
+            let retryAfter: TimeInterval? = retryAfterStr.flatMap { Double($0) }
+            RateLimiter.shared.recordLimit(Self.providerKey, retryAfter: retryAfter)
             throw ServiceError.httpError(429)
         default:
             throw ServiceError.httpError(httpResponse.statusCode)
@@ -276,9 +284,7 @@ struct GrokService: UsageService {
             return nil
         }
 
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        guard let date = formatter.date(from: endStr) ?? ISO8601DateFormatter().date(from: endStr) else {
+        guard let date = TimeFormatter.parseISO8601(endStr) else {
             // Fallback: try to pretty print the raw string like "2026-07-01"
             if let short = endStr.split(separator: "T").first {
                 let parts = short.split(separator: "-")

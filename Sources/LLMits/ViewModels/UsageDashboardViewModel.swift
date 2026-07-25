@@ -24,6 +24,9 @@ class UsageDashboardViewModel: ObservableObject {
     private var wakeObserver: NSObjectProtocol?
     private var errorRetryTask: Task<Void, Never>?
     private var errorRetryCount = 0
+    /// Coalesced refresh request that arrived while a refresh was in flight.
+    private var pendingRefresh = false
+    private var pendingForce = false
 
     private func service(for provider: Provider, antigravityServers: [AntigravityServerInfo] = []) -> UsageService {
         switch provider {
@@ -41,16 +44,11 @@ class UsageDashboardViewModel: ObservableObject {
     private var latestAccounts: [Account] = []
 
     func refreshAll(accounts: [Account], force: Bool = false) {
-        // Guard against concurrent refreshes
-        guard !isRefreshing else {
-            debugLog("[Dashboard] skipping refresh — already in progress")
-            return
-        }
-
         latestAccounts = accounts
 
         // Stale-while-revalidate: keep existing data visible unless this is a forced refresh
-        // or we have no cached rows for an account yet.
+        // or we have no cached rows for an account yet. Runs even while a
+        // refresh is in flight so added/removed accounts reconcile immediately.
         accountUsages = accounts.map { account in
             if let existing = accountUsages.first(where: { $0.account.id == account.id }) {
                 return AccountUsageData(
@@ -72,17 +70,26 @@ class UsageDashboardViewModel: ObservableObject {
             )
         }
 
+        // Guard against concurrent refreshes — coalesce instead of dropping:
+        // the in-flight refresh re-runs with the latest accounts when done.
+        guard !isRefreshing else {
+            pendingRefresh = true
+            pendingForce = pendingForce || force
+            debugLog("[Dashboard] refresh in progress — queued a follow-up")
+            return
+        }
+
         Task {
             isRefreshing = true
-            defer { isRefreshing = false }
             debugLog("[Dashboard] refreshAll with \(accounts.count) accounts")
 
             // Re-use cached Antigravity servers if discovered within last 60s
+            // (an empty result is cached too — "agy not running" shouldn't
+            // re-run ps discovery on every refresh).
             let antigravityServers: [AntigravityServerInfo]
             if accounts.contains(where: { $0.provider == .antigravity }) {
                 if let cached = lastDiscoveryTime,
-                   Date().timeIntervalSince(cached) < 60,
-                   !lastDiscoveredServers.isEmpty {
+                   Date().timeIntervalSince(cached) < 60 {
                     antigravityServers = lastDiscoveredServers
                     debugLog("[Dashboard] reusing \(antigravityServers.count) cached Antigravity servers")
                 } else {
@@ -99,27 +106,13 @@ class UsageDashboardViewModel: ObservableObject {
                 antigravityServers = []
             }
 
-            // Build service + token map (offload cheap file reads for cleanliness)
-            let accountsForTasks = accounts
-            let tokens = await withTaskGroup(of: (Int, String).self) { group -> [Int: String] in
-                var map: [Int: String] = [:]
-                for (i, account) in accountsForTasks.enumerated() {
-                    group.addTask {
-                        let t = KeychainManager.load(key: account.tokenKeychainKey) ?? "mock"
-                        return (i, t)
-                    }
-                }
-                for await (i, t) in group {
-                    map[i] = t
-                }
-                return map
-            }
-
+            // Build service + token map. Sequential: every KeychainManager.load
+            // reads the same store, so a per-account task group only added
+            // duplicated parsing.
             var tasks: [(UUID, UsageService, String)] = []
-            for (i, account) in accountsForTasks.enumerated() {
+            for account in accounts {
                 let svc = service(for: account.provider, antigravityServers: antigravityServers)
-                let token = tokens[i] ?? "mock"
-                debugLog("[Dashboard] queuing \(account.provider.rawValue) token=\(String(token.prefix(10)))")
+                let token = KeychainManager.load(key: account.tokenKeychainKey) ?? "mock"
                 tasks.append((account.id, svc, token))
             }
 
@@ -144,7 +137,10 @@ class UsageDashboardViewModel: ObservableObject {
                 for await (accountId, groups, error, identity) in group {
                     debugLog("[Dashboard] received result for \(accountId)")
                     if let idx = self.accountUsages.firstIndex(where: { $0.id == accountId }) {
-                        self.accountUsages[idx].groups = groups ?? []
+                        // Keep last-known-good groups on error — only replace on success.
+                        if let groups {
+                            self.accountUsages[idx].groups = groups
+                        }
                         self.accountUsages[idx].isLoading = false
                         self.accountUsages[idx].error = error
                         self.accountUsages[idx].identity = identity
@@ -160,6 +156,18 @@ class UsageDashboardViewModel: ObservableObject {
             }
             lastRefreshed = Date()
             scheduleErrorRetryIfNeeded()
+
+            // A refresh request that arrived while this one was in flight was
+            // coalesced into pendingRefresh — run it now with the latest
+            // accounts. isRefreshing must be cleared first or the call would
+            // just re-arm the flag.
+            isRefreshing = false
+            if pendingRefresh {
+                let force = pendingForce
+                pendingRefresh = false
+                pendingForce = false
+                refreshAll(accounts: latestAccounts, force: force)
+            }
         }
     }
 
@@ -168,6 +176,9 @@ class UsageDashboardViewModel: ObservableObject {
     /// failure never hammers anything. Resets once a refresh comes back clean.
     private func scheduleErrorRetryIfNeeded() {
         errorRetryTask?.cancel()
+        // Auto-refresh stopped (popover closed) — don't keep polling, a retry
+        // could trigger interactive Keychain prompts.
+        guard refreshTimer != nil else { return }
         guard accountUsages.contains(where: { $0.error != nil }) else {
             errorRetryCount = 0
             return
@@ -180,6 +191,8 @@ class UsageDashboardViewModel: ObservableObject {
         errorRetryTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             guard !Task.isCancelled, let self else { return }
+            // The popover may have closed while sleeping — re-check before refreshing.
+            guard self.refreshTimer != nil else { return }
             self.refreshAll(accounts: self.latestAccounts)
         }
     }

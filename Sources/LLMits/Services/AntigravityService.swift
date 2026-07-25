@@ -12,14 +12,6 @@ struct AntigravityServerInfo: Sendable {
 /// outside of Swift concurrency task groups — Process.waitUntilExit() deadlocks
 /// inside the cooperative thread pool executor.
 func discoverAntigravityServers() -> [AntigravityServerInfo] {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/bin/ps")
-    process.arguments = ["-ax", "-o", "pid=,command="]
-
-    let pipe = Pipe()
-    process.standardOutput = pipe
-    process.standardError = Pipe()
-
     guard let output = ProcessRunner.captureOutput(
         executable: "/bin/ps",
         arguments: ["-ax", "-o", "pid=,command="]
@@ -74,10 +66,10 @@ private func isAntigravityLanguageServer(_ command: String) -> Bool {
 }
 
 private func isAgyServerProcess(_ command: String) -> Bool {
-    let parts = command.split(separator: " ", maxSplits: 1)
-    let basename = parts.first.map(String.init) ?? command
-    if basename.hasSuffix("/agy") || basename == "agy" { return true }
-    return command.contains("/agy") || command.contains(" agy ")
+    // Match only an `agy` executable (first token's basename) — substring
+    // matching would false-positive on paths like ~/projects/agy-tools.
+    let firstToken = command.split(separator: " ", maxSplits: 1).first.map(String.init) ?? command
+    return URL(fileURLWithPath: firstToken).lastPathComponent == "agy"
 }
 
 private func discoverListeningPorts(pid: String) -> [Int] {
@@ -132,7 +124,14 @@ struct AntigravityService: UsageService {
             throw ServiceError.httpError(429)
         }
 
-        let servers = cachedServers.isEmpty ? discoverAntigravityServers() : cachedServers
+        // Offload the Process + wait so we don't block the current task's thread
+        // (the function itself documents it must be outside task groups due to wait).
+        let servers: [AntigravityServerInfo]
+        if cachedServers.isEmpty {
+            servers = await Task.detached { discoverAntigravityServers() }.value
+        } else {
+            servers = cachedServers
+        }
 
         // Strategy 1: Language server (Antigravity IDE / agy local quota surface)
         if !servers.isEmpty {
@@ -220,6 +219,14 @@ struct AntigravityService: UsageService {
                 guard let httpResponse = response as? HTTPURLResponse else {
                     throw ServiceError.invalidResponse
                 }
+
+                if httpResponse.statusCode == 429 {
+                    let retryAfterStr = httpResponse.value(forHTTPHeaderField: "Retry-After")
+                    let retryAfter: TimeInterval? = retryAfterStr.flatMap { Double($0) }
+                    RateLimiter.shared.recordLimit(Self.providerKey, retryAfter: retryAfter)
+                    throw ServiceError.httpError(429)
+                }
+
                 guard httpResponse.statusCode == 200 else {
                     throw ServiceError.httpError(httpResponse.statusCode)
                 }
@@ -374,18 +381,25 @@ struct AntigravityService: UsageService {
         var limits: [UsageLimit] = []
 
         func buildLSLimit(name: String, models: [ModelQuotaEntry]) -> UsageLimit? {
-            guard let rep = models.first else { return nil }
+            // Representative: the most constrained model (minimum remaining
+            // fraction) — deterministic regardless of dictionary order.
+            guard let rep = models.min(by: { $0.remainingFraction < $1.remainingFraction }) else { return nil }
+            // Infer the window from the reset time: > 24h out means weekly.
+            let isWeekly = rep.resetTime
+                .flatMap(TimeFormatter.parseISO8601)
+                .map { $0.timeIntervalSinceNow > 24 * 3600 } ?? false
+            let windowType: UsageLimit.WindowType = isWeekly ? .weekly : .fiveHour
             let (adjustedUsed, resetDetail) = TimeFormatter.adjustForStaleReset(
                 percentUsed: 1.0 - rep.remainingFraction,
                 resetDateString: rep.resetTime,
-                windowSeconds: TimeFormatter.fiveHourSeconds
+                windowSeconds: isWeekly ? TimeFormatter.weeklySeconds : TimeFormatter.fiveHourSeconds
             )
             let modelsStr = models.map(\.label).joined(separator: ", ")
             var detail = modelsStr
             if let rd = resetDetail, !rd.isEmpty {
                 detail = "\(modelsStr) · \(rd)"
             }
-            return UsageLimit(name: name, percentUsed: adjustedUsed, detail: detail, windowType: .fiveHour)
+            return UsageLimit(name: name, percentUsed: adjustedUsed, detail: detail, windowType: windowType)
         }
 
         if let l = buildLSLimit(name: "Gemini Pro", models: geminiPro) { limits.append(l) }

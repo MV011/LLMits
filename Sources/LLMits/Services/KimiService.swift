@@ -28,12 +28,20 @@ struct KimiService: UsageService {
             case 401, 403:
                 throw ServiceError.noCredentials("Kimi Code credentials expired or invalid.")
             case 429:
-                RateLimiter.shared.recordLimit(Self.providerKey)
+                let retryAfterStr = httpResponse.value(forHTTPHeaderField: "Retry-After")
+                let retryAfter: TimeInterval? = retryAfterStr.flatMap { Double($0) }
+                RateLimiter.shared.recordLimit(Self.providerKey, retryAfter: retryAfter)
                 throw ServiceError.httpError(429)
             default:
                 throw ServiceError.httpError(httpResponse.statusCode)
             }
-        } catch ServiceError.noCredentials {
+        } catch ServiceError.noCredentials(let message) {
+            // A pasted manual token can't be refreshed — retrying would just
+            // re-send the identical token, guaranteed to fail.
+            if token != "mock-token" && token != "mock" && !token.isEmpty {
+                throw ServiceError.noCredentials(message)
+            }
+
             // Token might be stale — retry ONCE with a fresh read of the credentials file
             debugLog("[Kimi] got auth error, retrying with fresh credentials")
             TokenCache.shared.remove(Self.providerKey)
@@ -46,8 +54,13 @@ struct KimiService: UsageService {
                 RateLimiter.shared.clear(Self.providerKey)
                 return try parseUsageResponse(retryData)
             } else if retryResponse.statusCode == 429 {
-                RateLimiter.shared.recordLimit(Self.providerKey)
+                let retryAfterStr = retryResponse.value(forHTTPHeaderField: "Retry-After")
+                let retryAfter: TimeInterval? = retryAfterStr.flatMap { Double($0) }
+                RateLimiter.shared.recordLimit(Self.providerKey, retryAfter: retryAfter)
                 throw ServiceError.httpError(429)
+            } else if retryResponse.statusCode == 401 || retryResponse.statusCode == 403 {
+                // Retry failed the same way — keep the actionable message
+                throw ServiceError.noCredentials(message)
             } else {
                 throw ServiceError.httpError(retryResponse.statusCode)
             }

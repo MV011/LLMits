@@ -15,39 +15,60 @@ struct KeychainManager {
     }()
 
     static func save(key: String, value: String) throws {
-        var store = loadStore()
+        var store = try loadStore()
         store[key] = value
-        saveStore(store)
+        try saveStore(store)
     }
 
     static func load(key: String) -> String? {
-        loadStore()[key]
+        (try? loadStore())?[key]
     }
 
     static func delete(key: String) {
-        var store = loadStore()
+        // Refuse to touch the store if it can't be read — see loadStore.
+        guard var store = try? loadStore() else { return }
         store.removeValue(forKey: key)
-        saveStore(store)
+        try? saveStore(store)
     }
 
     // MARK: - File I/O
 
-    private static func loadStore() -> [String: String] {
-        guard let data = try? Data(contentsOf: storageFile),
-              let dict = try? JSONDecoder().decode([String: String].self, from: data) else {
-            return [:]
+    /// Throws on anything but a missing file. A corrupt store must NOT be
+    /// treated as empty: the next save would silently wipe all other tokens.
+    private static func loadStore() throws -> [String: String] {
+        do {
+            let data = try Data(contentsOf: storageFile)
+            return try JSONDecoder().decode([String: String].self, from: data)
+        } catch {
+            let nsError = error as NSError
+            if nsError.domain == NSCocoaErrorDomain && nsError.code == NSFileReadNoSuchFileError {
+                return [:]  // No store yet — legitimately empty
+            }
+            debugLog("[Keychain] loadStore failed, refusing to treat store as empty: \(error)")
+            throw error
         }
-        return dict
     }
 
-    private static func saveStore(_ store: [String: String]) {
-        try? FileManager.default.createDirectory(at: storageDir, withIntermediateDirectories: true)
-        if let data = try? JSONEncoder().encode(store) {
-            try? data.write(to: storageFile, options: .atomic)
-            // Set owner-only permissions (0600)
-            try? FileManager.default.setAttributes(
+    private static func saveStore(_ store: [String: String]) throws {
+        do {
+            try FileManager.default.createDirectory(at: storageDir, withIntermediateDirectories: true)
+            // Create the file 0600 up front so it never exists world-readable —
+            // the atomic write below would create it 0644 before any chmod.
+            if !FileManager.default.fileExists(atPath: storageFile.path) {
+                FileManager.default.createFile(
+                    atPath: storageFile.path, contents: nil,
+                    attributes: [.posixPermissions: 0o600]
+                )
+            }
+            let data = try JSONEncoder().encode(store)
+            try data.write(to: storageFile, options: .atomic)
+            // Atomic write re-creates the file — re-assert owner-only permissions (0600)
+            try FileManager.default.setAttributes(
                 [.posixPermissions: 0o600], ofItemAtPath: storageFile.path
             )
+        } catch {
+            debugLog("[Keychain] saveStore failed: \(error)")
+            throw error
         }
     }
 }

@@ -11,6 +11,9 @@ struct MenuBarPopover: View {
     @EnvironmentObject var dashboardVM: UsageDashboardViewModel
     @EnvironmentObject var accountsVM: AccountsViewModel
     @State private var currentPage: PopoverPage = .dashboard
+    /// Token presence per account, hoisted out of view-body renders —
+    /// KeychainManager.load does disk I/O + JSON parse on every call.
+    @State private var tokenPresence: [UUID: Bool] = [:]
 
     var body: some View {
         VStack(spacing: 0) {
@@ -26,10 +29,12 @@ struct MenuBarPopover: View {
         .frame(width: 360, height: 520)
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {
+            updateTokenPresence()
             accountsVM.runAutoDiscoveryIfNeeded()
             dashboardVM.refreshOnAppear(accounts: accountsVM.accounts)
         }
         .onChange(of: accountsVM.accounts) { oldAccounts, newAccounts in
+            updateTokenPresence()
             let oldIds = Set(oldAccounts.map(\.id))
             let newIds = Set(newAccounts.map(\.id))
             guard oldIds != newIds else { return }
@@ -330,9 +335,18 @@ struct MenuBarPopover: View {
         }
     }
 
+    /// Single pass over all accounts reading token presence from disk.
+    private func updateTokenPresence() {
+        tokenPresence = Dictionary(
+            uniqueKeysWithValues: accountsVM.accounts.map {
+                ($0.id, KeychainManager.load(key: $0.tokenKeychainKey) != nil)
+            }
+        )
+    }
+
     private func accountRow(_ account: Account) -> some View {
         HStack(spacing: 10) {
-            let hasToken = KeychainManager.load(key: account.tokenKeychainKey) != nil
+            let hasToken = tokenPresence[account.id] ?? false
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(account.displayName)

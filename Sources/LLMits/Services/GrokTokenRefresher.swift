@@ -81,6 +81,13 @@ enum GrokTokenRefresher {
             return nil
         }
 
+        // A grok session may have started while we waited for the lock — its
+        // in-memory refresh token must not be burned by our rotation.
+        if await hasLiveCLISession() {
+            debugLog("[GrokRefresh] live grok session appeared during lock wait, deferring to the CLI")
+            return nil
+        }
+
         // The network call happens while holding the lock: rotation makes
         // read + refresh + write one atomic unit as far as the CLI is concerned.
         guard let refreshed = await performRefresh(refreshToken: refreshToken, clientID: clientID) else {
@@ -101,6 +108,8 @@ enum GrokTokenRefresher {
         if let out = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys]) {
             do {
                 try out.write(to: authURL, options: .atomic)
+                // .atomic replaces the file with default 0644 perms — restore 0600
+                try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: authURL.path)
                 debugLog("[GrokRefresh] token refreshed and persisted (expires in \(Int(refreshed.expiresIn ?? 3600))s)")
             } catch {
                 // The rotated refresh token now exists only in memory; the CLI

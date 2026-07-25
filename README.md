@@ -22,8 +22,8 @@ A lightweight macOS menu bar app that tracks your AI coding tool usage and limit
 - **Zero-config setup** — auto-discovers credentials from installed CLI tools
 - **Collapsed cards** — see all providers at a glance with key metrics
 - **Red alerts** — cards turn red when limits are exhausted, with countdown timers
-- **Auto-refresh** — usage data refreshes every 5 minutes
-- **Token refresh** — automatically refreshes expired OAuth tokens (Anthropic)
+- **Auto-refresh** — usage data refreshes every 10 minutes
+- **Token refresh** — self-refreshes expired OAuth tokens (Grok, Antigravity); Claude tokens are refreshed by Claude Code itself and re-read from the Keychain
 - **Native macOS** — lightweight SwiftUI menu bar app, no Electron
 
 ## Requirements
@@ -92,15 +92,24 @@ Sources/LLMits/
 ├── Views/                  # SwiftUI views (MenuBarPopover, ProviderSection)
 ├── ViewModels/             # View models (AccountsViewModel, UsageDashboardViewModel)
 ├── Services/               # API services per provider + utilities
-│   ├── AnthropicService.swift    # Claude Code OAuth + usage API
-│   ├── OpenAIService.swift       # Codex CLI usage API
-│   ├── CursorService.swift       # Cursor SQLite + cookie auth
-│   ├── AntigravityService.swift  # Local server discovery + quota API
-│   ├── GrokService.swift         # Grok Build auth.json + billing API
-│   ├── KimiService.swift         # Kimi Code credentials + usages API
-│   ├── KeychainManager.swift     # File-based token storage
-│   ├── TokenCache.swift          # In-memory credential cache
-│   └── TimeFormatter.swift       # Reset countdown formatting
+│   ├── AnthropicService.swift     # Claude Code OAuth + usage API
+│   ├── AntigravityService.swift   # Local server discovery + quota API
+│   ├── CredentialWatcher.swift    # Debounced credential-change watcher
+│   ├── CursorService.swift        # Cursor SQLite + cookie auth
+│   ├── DebugLog.swift             # File-based debug log (/tmp/llmits_debug.log)
+│   ├── GoogleOAuthHelper.swift    # Google OAuth read + refresh (Antigravity)
+│   ├── GrokService.swift          # Grok Build auth.json + billing API
+│   ├── GrokTokenRefresher.swift   # Grok OAuth self-refresh
+│   ├── JWT.swift                  # Local JWT payload/expiry decoding
+│   ├── KeychainManager.swift      # File-based token storage
+│   ├── KimiService.swift          # Kimi Code credentials + usages API
+│   ├── OpenAIService.swift        # Codex CLI usage API
+│   ├── ProcessRunner.swift        # External command runner (ps, lsof, sqlite3)
+│   ├── RateLimiter.swift          # Per-provider 429 backoff
+│   ├── ServiceError.swift         # Shared service error type
+│   ├── TimeFormatter.swift        # Reset countdown formatting
+│   ├── TokenCache.swift           # In-memory credential cache
+│   └── UsageService.swift         # Provider service protocol
 └── Resources/              # Provider SVG icons
 ```
 

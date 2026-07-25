@@ -21,22 +21,34 @@ enum Provider: String, Codable, CaseIterable, Identifiable {
         }
     }
 
+    /// Loaded icons are cached — NSImage(contentsOf:) does a disk read + SVG
+    /// parse, so it must not run on every render (the Add sheet draws 6 icons
+    /// per keystroke).
+    private static var iconCache: [Provider: NSImage] = [:]
+
     @ViewBuilder
     var icon: some View {
-        if let url = Bundle.module.url(forResource: iconResourceName, withExtension: "svg"),
-           let nsImage = NSImage(contentsOf: url) {
-            
+        if let nsImage = cachedIcon {
+
             Image(nsImage: nsImage)
                 .resizable()
                 .renderingMode(.template)
                 .foregroundColor(brandColor)
-            
+
         } else {
             // Fallback if resource fails
             Image(systemName: "questionmark.app")
                 .resizable()
                 .foregroundColor(.red)
         }
+    }
+
+    private var cachedIcon: NSImage? {
+        if let cached = Self.iconCache[self] { return cached }
+        guard let url = Bundle.module.url(forResource: iconResourceName, withExtension: "svg"),
+              let nsImage = NSImage(contentsOf: url) else { return nil }
+        Self.iconCache[self] = nsImage
+        return nsImage
     }
 
     /// Resource name for the SVG icon (decoupled from rawValue for cases like geminiCLI)

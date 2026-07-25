@@ -42,7 +42,6 @@ final class RateLimiter: @unchecked Sendable {
     /// Pass `retryAfter` from the HTTP header to override the calculated backoff.
     func recordLimit(_ provider: String, retryAfter: TimeInterval? = nil) {
         lock.lock()
-        defer { lock.unlock() }
 
         let hits = (consecutiveHits[provider] ?? 0) + 1
         consecutiveHits[provider] = hits
@@ -55,8 +54,11 @@ final class RateLimiter: @unchecked Sendable {
             backoff = min(baseBackoff * pow(2.0, Double(hits - 1)), maxBackoff)
         }
 
-        debugLog("[RateLimiter] \(provider): hit #\(hits), backing off \(Int(backoff))s")
         backoffUntil[provider] = Date().addingTimeInterval(backoff)
+        lock.unlock()
+
+        // File I/O — keep it outside the lock.
+        debugLog("[RateLimiter] \(provider): hit #\(hits), backing off \(Int(backoff))s")
     }
 
     /// Clear backoff for a provider (e.g., after a successful request).

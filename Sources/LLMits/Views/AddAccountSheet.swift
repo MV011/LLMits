@@ -9,6 +9,14 @@ struct AddAccountView: View {
     @State private var displayName = ""
     @State private var token = ""
 
+    /// Auto-discovered providers that already have an account are hidden —
+    /// they read the same on-disk credentials, so a second card is meaningless.
+    private var selectableProviders: [Provider] {
+        Provider.allCases.filter {
+            !$0.isAutoDiscovered || accountsVM.accountsFor(provider: $0).isEmpty
+        }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             // Header
@@ -55,7 +63,7 @@ struct AddAccountView: View {
                             .padding(.leading, 2)
 
                         VStack(spacing: 4) {
-                            ForEach(Provider.allCases) { provider in
+                            ForEach(selectableProviders) { provider in
                                 Button {
                                     selectedProvider = provider
                                 } label: {
@@ -171,10 +179,11 @@ struct AddAccountView: View {
                     let name = displayName.isEmpty
                         ? "\(selectedProvider.displayName) Account"
                         : displayName
+                    let trimmedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
                     accountsVM.addAccount(
                         provider: selectedProvider,
                         displayName: name,
-                        token: token.isEmpty ? "mock-token" : token
+                        token: trimmedToken.isEmpty ? "mock-token" : trimmedToken
                     )
                     onDone()
                 } label: {

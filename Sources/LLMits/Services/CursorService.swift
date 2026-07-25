@@ -32,7 +32,7 @@ struct CursorService: UsageService {
             // token rotation a moment to land in state.vscdb before re-reading;
             // otherwise the re-read is always identical and the retry never fires.
             debugLog("[Cursor] got \(code), re-reading DB for fresh tokens")
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            try await Task.sleep(nanoseconds: 1_500_000_000)
             guard let freshCookie = await Self.buildCookieFromDBAsync() else {
                 throw ServiceError.noCredentials(
                     "Cursor session expired. Open Cursor to refresh, then retry."
@@ -56,10 +56,27 @@ struct CursorService: UsageService {
         async let stripeData = fetchStripe(cookie: cookie)
 
         let summary = try await summaryData
-        let planInfo = try? await planData
-        let stripe = try? await stripeData
 
-        RateLimiter.shared.clear(Self.providerKey)
+        var planInfo: [String: Any]?
+        var stripe: [String: Any]?
+        var siblingHit429 = false
+        do {
+            planInfo = try await planData
+        } catch {
+            debugLog("[Cursor] plan info fetch failed (continuing): \(error)")
+            if case ServiceError.httpError(429) = error { siblingHit429 = true }
+        }
+        do {
+            stripe = try await stripeData
+        } catch {
+            debugLog("[Cursor] stripe fetch failed (continuing): \(error)")
+            if case ServiceError.httpError(429) = error { siblingHit429 = true }
+        }
+
+        // A sibling 429 already recorded the limit — don't erase it.
+        if !siblingHit429 {
+            RateLimiter.shared.clear(Self.providerKey)
+        }
         return parseUsageSummary(summary, planInfo: planInfo, stripe: stripe)
     }
 
@@ -72,7 +89,7 @@ struct CursorService: UsageService {
         }
 
         // Fallback: use manual token if provided
-        if manualToken != "mock-token" && !manualToken.isEmpty {
+        if manualToken != "mock-token" && manualToken != "mock" && !manualToken.isEmpty {
             if manualToken.contains("WorkosCursorSessionToken") {
                 return manualToken
             }
@@ -119,10 +136,12 @@ struct CursorService: UsageService {
 
         guard FileManager.default.fileExists(atPath: dbPath) else { return nil }
 
-        // Use sqlite3 to read tokens (via helper to centralize Process logic)
+        // Use sqlite3 to read tokens (via helper to centralize Process logic).
+        // Read-only URI + busy timeout: state.vscdb is live while Cursor runs.
         guard let output = ProcessRunner.captureOutput(
             executable: "/usr/bin/sqlite3",
-            arguments: [dbPath, """
+            arguments: ["file:\(dbPath)?mode=ro", """
+                .timeout 1000
                 SELECT key, value FROM ItemTable 
                 WHERE key IN ('cursorAuth/accessToken', 'cursorAuth/refreshToken');
             """]
@@ -417,7 +436,7 @@ struct CursorService: UsageService {
 
     private func billingResetSuffix(summary: [String: Any], planInfoObj: [String: Any]?) -> String? {
         if let endStr = summary["billingCycleEnd"] as? String,
-           let endDate = parseISO8601(endStr), endDate > Date(),
+           let endDate = TimeFormatter.parseISO8601(endStr), endDate > Date(),
            let remaining = TimeFormatter.formatRemaining(endDate.timeIntervalSinceNow) {
             return remaining
         }
@@ -471,27 +490,21 @@ struct CursorService: UsageService {
     }
 
     /// Shared currency formatter — avoids re-allocation on every call.
+    /// Fraction digits fixed at 0...2 so whole dollars trim trailing zeros
+    /// without mutating the shared formatter per call.
     private static let currencyFormatter: NumberFormatter = {
         let formatter = NumberFormatter()
         formatter.numberStyle = .currency
         formatter.currencyCode = "USD"
+        formatter.minimumFractionDigits = 0
+        formatter.maximumFractionDigits = 2
         return formatter
     }()
 
     /// Format cent values as dollar strings.
-    /// API values are in cents: 976970 → $9,769.70
+    /// API values are in cents: 50000 → $500, 976975 → $9,769.75
     private func formatCents(_ cents: Int) -> String {
         let dollars = Double(cents) / 100.0
-        let formatter = Self.currencyFormatter
-        formatter.maximumFractionDigits = dollars == Double(Int(dollars)) ? 0 : 2
-        return formatter.string(from: NSNumber(value: dollars)) ?? String(format: "$%.2f", dollars)
-    }
-
-    private func parseISO8601(_ str: String) -> Date? {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = formatter.date(from: str) { return d }
-        formatter.formatOptions = [.withInternetDateTime]
-        return formatter.date(from: str)
+        return Self.currencyFormatter.string(from: NSNumber(value: dollars)) ?? String(format: "$%.2f", dollars)
     }
 }
