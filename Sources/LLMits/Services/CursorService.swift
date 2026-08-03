@@ -138,13 +138,16 @@ struct CursorService: UsageService {
 
         // Use sqlite3 to read tokens (via helper to centralize Process logic).
         // Read-only URI + busy timeout: state.vscdb is live while Cursor runs.
+        // Pass .timeout and SQL as separate argv entries. A single multiline
+        // argument containing a dot-command makes sqlite3 exit 0 with empty
+        // stdout, so auto-discovery silently fails ("not logged in").
         guard let output = ProcessRunner.captureOutput(
             executable: "/usr/bin/sqlite3",
-            arguments: ["file:\(dbPath)?mode=ro", """
-                .timeout 1000
-                SELECT key, value FROM ItemTable 
-                WHERE key IN ('cursorAuth/accessToken', 'cursorAuth/refreshToken');
-            """]
+            arguments: [
+                "file:\(dbPath)?mode=ro",
+                ".timeout 1000",
+                "SELECT key, value FROM ItemTable WHERE key IN ('cursorAuth/accessToken', 'cursorAuth/refreshToken');"
+            ]
         ) else { return nil }
 
         var accessToken: String?
