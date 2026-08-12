@@ -1,4 +1,5 @@
 import SwiftUI
+import LLMitsCore
 
 @main
 struct LLMitsApp: App {

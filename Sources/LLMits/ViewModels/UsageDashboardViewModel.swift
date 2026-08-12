@@ -14,14 +14,18 @@ struct AccountUsageData: Identifiable {
 }
 
 @MainActor
-class UsageDashboardViewModel: ObservableObject {
+public class UsageDashboardViewModel: ObservableObject {
     @Published var accountUsages: [AccountUsageData] = []
     @Published var isRefreshing = false
     @Published var lastRefreshed: Date?
 
+    public init() {}
+
     private var refreshTimer: Timer?
+    private var resetWatcher: Timer?
     private var credentialWatcher: CredentialWatcher?
     private var wakeObserver: NSObjectProtocol?
+    private let snapshotStore = UsageSnapshotStore.shared
     private var errorRetryTask: Task<Void, Never>?
     private var errorRetryCount = 0
     /// Coalesced refresh request that arrived while a refresh was in flight.
@@ -144,6 +148,7 @@ class UsageDashboardViewModel: ObservableObject {
                         self.accountUsages[idx].isLoading = false
                         self.accountUsages[idx].error = error
                         self.accountUsages[idx].identity = identity
+                        self.persistSnapshot(self.accountUsages[idx])
                     }
                 }
             }
@@ -199,13 +204,60 @@ class UsageDashboardViewModel: ObservableObject {
 
     func refreshOnAppear(accounts: [Account]) {
         latestAccounts = accounts
+        hydrateFromSnapshots(accounts: accounts)
         let isStale = lastRefreshed.map { Date().timeIntervalSince($0) > 60 } ?? true
         if isStale {
             refreshAll(accounts: accounts)
         }
         startPeriodicRefresh()
+        startResetWatcher()
         startCredentialWatcher()
         startWakeObserver()
+    }
+
+    /// Paint last-synced API rows immediately so the popover isn't empty while
+    /// the network refresh runs. Countdowns tick from stored `resetAt`.
+    private func hydrateFromSnapshots(accounts: [Account]) {
+        let snaps = snapshotStore.loadAll()
+        accountUsages = accounts.map { account in
+            if let existing = accountUsages.first(where: { $0.account.id == account.id }),
+               !existing.groups.isEmpty {
+                return existing
+            }
+            if let snap = snaps[account.id] {
+                return AccountUsageData(
+                    id: account.id,
+                    account: account,
+                    groups: snap.groups,
+                    isLoading: false,
+                    error: snap.error,
+                    identity: snap.identity
+                )
+            }
+            return AccountUsageData(
+                id: account.id,
+                account: account,
+                groups: [],
+                isLoading: true,
+                error: nil,
+                identity: nil
+            )
+        }
+        if lastRefreshed == nil {
+            lastRefreshed = snaps.values.map(\.fetchedAt).max()
+        }
+    }
+
+    private func persistSnapshot(_ usage: AccountUsageData) {
+        guard !usage.groups.isEmpty || usage.error != nil else { return }
+        snapshotStore.save(UsageSnapshot(
+            accountID: usage.account.id,
+            provider: usage.account.provider,
+            fetchedAt: Date(),
+            identity: usage.identity,
+            groups: usage.groups,
+            error: usage.error
+        ))
     }
 
     private func startPeriodicRefresh() {
@@ -216,6 +268,30 @@ class UsageDashboardViewModel: ObservableObject {
                 self.refreshAll(accounts: self.latestAccounts)
             }
         }
+    }
+
+    /// When a stored window end is reached, re-fetch so % and the next reset
+    /// come from the API instead of staying at the expired snapshot.
+    private func startResetWatcher() {
+        guard resetWatcher == nil else { return }
+        resetWatcher = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.refreshTimer != nil, self.hasExpiredWindow else { return }
+                debugLog("[Dashboard] a usage window expired locally — refreshing")
+                self.refreshAll(accounts: self.latestAccounts)
+            }
+        }
+    }
+
+    private var hasExpiredWindow: Bool {
+        let now = Date()
+        return accountUsages
+            .flatMap(\.groups)
+            .flatMap(\.limits)
+            .contains { limit in
+                guard let resetAt = limit.resetAt else { return false }
+                return resetAt <= now && (lastRefreshed.map { $0 < resetAt } ?? true)
+            }
     }
 
     /// Refresh as soon as a CLI credential changes on disk (login, logout,
@@ -266,6 +342,8 @@ class UsageDashboardViewModel: ObservableObject {
     func stopAutoRefresh() {
         refreshTimer?.invalidate()
         refreshTimer = nil
+        resetWatcher?.invalidate()
+        resetWatcher = nil
         errorRetryTask?.cancel()
         errorRetryTask = nil
         // The credential watcher and wake observer intentionally stay alive —

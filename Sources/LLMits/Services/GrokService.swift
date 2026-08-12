@@ -15,7 +15,7 @@ struct GrokService: UsageService {
             throw ServiceError.httpError(429)
         }
 
-        var accessToken = try await resolveAccessToken(manualToken: token)
+        let accessToken = try await resolveAccessToken(manualToken: token)
 
         do {
             async let creditsTask = fetchBillingData(url: creditsURL, token: accessToken)
@@ -24,7 +24,7 @@ struct GrokService: UsageService {
             let (creditsData, plainData) = try await (creditsTask, plainTask)
 
             RateLimiter.shared.clear(Self.providerKey)
-            return try parseBillingResponses(credits: creditsData, plain: plainData)
+            return try GrokBillingParser.parse(credits: creditsData, plain: plainData)
         } catch ServiceError.noCredentials(let message) {
             // A pasted manual token can't be refreshed — retrying would just
             // re-send the identical token, guaranteed to fail.
@@ -38,15 +38,15 @@ struct GrokService: UsageService {
             TokenCache.shared.remove(Self.providerKey)
             TokenCache.shared.removeObject(Self.providerKey + ".expiresAt")
 
-            accessToken = try await resolveAccessToken(manualToken: token, forceFresh: true)
+            let retryToken = try await resolveAccessToken(manualToken: token, forceFresh: true)
 
-            async let creditsTask = fetchBillingData(url: creditsURL, token: accessToken)
-            async let plainTask = fetchBillingData(url: billingURL, token: accessToken)
+            async let creditsTask = fetchBillingData(url: creditsURL, token: retryToken)
+            async let plainTask = fetchBillingData(url: billingURL, token: retryToken)
 
             let (creditsData, plainData) = try await (creditsTask, plainTask)
 
             RateLimiter.shared.clear(Self.providerKey)
-            return try parseBillingResponses(credits: creditsData, plain: plainData)
+            return try GrokBillingParser.parse(credits: creditsData, plain: plainData)
         }
     }
 
@@ -196,118 +196,4 @@ struct GrokService: UsageService {
         }
     }
 
-    // MARK: - Response Parsing
-
-    private func parseBillingResponses(credits: Data, plain: Data) throws -> [UsageGroup] {
-        guard let creditsJson = try? JSONSerialization.jsonObject(with: credits) as? [String: Any],
-              let plainJson = try? JSONSerialization.jsonObject(with: plain) as? [String: Any] else {
-            throw ServiceError.parseError("Invalid JSON response from Grok billing")
-        }
-
-        let creditsConfig = creditsJson["config"] as? [String: Any] ?? [:]
-        let plainConfig = plainJson["config"] as? [String: Any] ?? [:]
-
-        var limits: [UsageLimit] = []
-
-        let resetDetail = Self.formatResetDetail(from: creditsConfig["currentPeriod"] as? [String: Any] ?? plainConfig["currentPeriod"] as? [String: Any])
-
-        // Raw quota numbers (from plain billing) — these are the "counted number of credits"
-        var rawUsed: Double?
-        var rawLimit: Double?
-        if let ml = plainConfig["monthlyLimit"] as? [String: Any],
-           let u = plainConfig["used"] as? [String: Any] {
-            rawLimit = (ml["val"] as? Double) ?? (ml["val"] as? Int).map(Double.init)
-            rawUsed = (u["val"] as? Double) ?? (u["val"] as? Int).map(Double.init)
-        }
-
-        // Prefer calculating the bar % directly from the counted credits (raw used/limit).
-        // This makes the visual bar, the "% used" text, and the numbers in parentheses consistent.
-        // The creditUsagePercent field from the API often doesn't match the raw calculation
-        // (off by ~100x in observations), so we treat the raw numbers as the source of truth
-        // for "actual counted credits".
-        if let limit = rawLimit, let used = rawUsed, limit > 0 {
-            let pct = min(used / limit, 1.0)
-            let usedPct = Int(round(pct * 100))
-            var detail = "\(usedPct)% used"
-            detail += String(format: " (%.0f / %.0f)", used, limit)
-            if let r = resetDetail {
-                detail += " · \(r)"
-            }
-            limits.append(UsageLimit(
-                name: "Build Credits",
-                percentUsed: pct,
-                detail: detail,
-                windowType: .monthly
-            ))
-        } else if let pct = creditsConfig["creditUsagePercent"] as? Double {
-            // Fallback to API percent only if no raw numbers
-            let normalized = pct > 1.0 ? pct / 100.0 : pct
-            let usedPct = Int(round(normalized * 100))
-            var detail = "\(usedPct)% used"
-            if let r = resetDetail {
-                detail += " · \(r)"
-            }
-            limits.append(UsageLimit(
-                name: "Build Credits",
-                percentUsed: min(normalized, 1.0),
-                detail: detail,
-                windowType: .monthly
-            ))
-        }
-
-        // Secondary bar for On-Demand / Pay-as-you-go if the plan has it configured
-        let onDemandCap = (creditsConfig["onDemandCap"] as? [String: Any] ?? plainConfig["onDemandCap"] as? [String: Any])?["val"]
-        let onDemandUsed = (creditsConfig["onDemandUsed"] as? [String: Any] ?? plainConfig["onDemandUsed"] as? [String: Any])?["val"]
-        if let cap = (onDemandCap as? Double) ?? (onDemandCap as? Int).map(Double.init), cap > 0,
-           let used = (onDemandUsed as? Double) ?? (onDemandUsed as? Int).map(Double.init) {
-            let pct = min(used / cap, 1.0)
-            limits.append(UsageLimit(
-                name: "On-Demand",
-                percentUsed: pct,
-                detail: String(format: "%.0f / %.0f", used, cap),
-                windowType: .monthly
-            ))
-        }
-
-        if limits.isEmpty {
-            limits.append(UsageLimit(name: "Subscription", percentUsed: 0, detail: "Active", windowType: .monthly))
-        }
-
-        return [UsageGroup(name: "Grok Build", limits: limits)]
-    }
-
-    // MARK: - Helpers
-
-    private static func formatResetDetail(from currentPeriod: [String: Any]?) -> String? {
-        guard let cp = currentPeriod,
-              let endStr = cp["end"] as? String ?? cp["billingPeriodEnd"] as? String else {
-            return nil
-        }
-
-        guard let date = TimeFormatter.parseISO8601(endStr) else {
-            // Fallback: try to pretty print the raw string like "2026-07-01"
-            if let short = endStr.split(separator: "T").first {
-                let parts = short.split(separator: "-")
-                if parts.count == 3 {
-                    let month = Int(parts[1]) ?? 0
-                    let day = Int(parts[2]) ?? 0
-                    let monthName = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][safe: month] ?? ""
-                    if !monthName.isEmpty {
-                        return "Resets \(monthName) \(day)"
-                    }
-                }
-            }
-            return nil
-        }
-
-        let df = DateFormatter()
-        df.dateFormat = "MMM d"
-        return "Resets \(df.string(from: date))"
-    }
-}
-
-private extension Array {
-    subscript(safe index: Int) -> Element? {
-        return indices.contains(index) ? self[index] : nil
-    }
 }

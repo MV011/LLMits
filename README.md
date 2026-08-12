@@ -14,7 +14,7 @@ A lightweight macOS menu bar app that tracks your AI coding tool usage and limit
 | **OpenAI** (Codex CLI) | Auto-discovered from `~/.codex/auth.json` | 5h session limits, weekly limits, code review, credit balance |
 | **Cursor** | Auto-discovered from local SQLite DB | Premium requests, extra usage |
 | **Antigravity** | Auto-discovered from running server | Per-model quotas with 5h reset windows |
-| **xAI (Grok Build)** | Auto-discovered from `~/.grok/auth.json` | Monthly subscription credits (SuperGrok / X Premium+) |
+| **xAI (Grok Build)** | Auto-discovered from `~/.grok/auth.json` | Shared weekly usage pool (unified billing, June 2026+), extra / on-demand credits |
 | **Kimi Code** | Auto-discovered from `~/.kimi-code/credentials` | Weekly quota, rolling 5-hour rate window |
 
 ## Features
@@ -22,7 +22,8 @@ A lightweight macOS menu bar app that tracks your AI coding tool usage and limit
 - **Zero-config setup** — auto-discovers credentials from installed CLI tools
 - **Collapsed cards** — see all providers at a glance with key metrics
 - **Red alerts** — cards turn red when limits are exhausted, with countdown timers
-- **Auto-refresh** — usage data refreshes every 10 minutes
+- **Auto-refresh** — usage data refreshes every 10 minutes; countdowns tick locally from the last synced reset time
+- **Last-synced cache** — last API snapshot is stored in `~/Library/Application Support/LLMits/usage.sqlite` so the popover opens with the previous numbers immediately
 - **Token refresh** — self-refreshes expired OAuth tokens (Grok, Antigravity); Claude tokens are refreshed by Claude Code itself and re-read from the Keychain
 - **Native macOS** — lightweight SwiftUI menu bar app, no Electron
 
@@ -86,31 +87,20 @@ If auto-discovery doesn't work, click **"+ Add Account"** in the popover to manu
 ## Project Structure
 
 ```
-Sources/LLMits/
-├── App/                    # App entry point (LLMitsApp)
-├── Models/                 # Data models (Account, Provider, UsageLimit)
-├── Views/                  # SwiftUI views (MenuBarPopover, ProviderSection)
-├── ViewModels/             # View models (AccountsViewModel, UsageDashboardViewModel)
-├── Services/               # API services per provider + utilities
-│   ├── AnthropicService.swift     # Claude Code OAuth + usage API
-│   ├── AntigravityService.swift   # Local server discovery + quota API
-│   ├── CredentialWatcher.swift    # Debounced credential-change watcher
-│   ├── CursorService.swift        # Cursor SQLite + cookie auth
-│   ├── DebugLog.swift             # File-based debug log (/tmp/llmits_debug.log)
-│   ├── GoogleOAuthHelper.swift    # Google OAuth read + refresh (Antigravity)
+Sources/LLMitsApp/          # @main menu-bar entry (depends on LLMitsCore)
+Sources/LLMits/             # LLMitsCore library
+├── Models/                 # Account, Provider, UsageLimit (resetAt), UsageGroup
+├── Views/                  # MenuBarPopover, ProviderSection, live countdown rows
+├── ViewModels/             # AccountsViewModel, UsageDashboardViewModel
+├── Services/               # API services per provider + last-synced SQLite cache
+│   ├── GrokBillingParser.swift    # Unified weekly + legacy monthly billing
 │   ├── GrokService.swift          # Grok Build auth.json + billing API
-│   ├── GrokTokenRefresher.swift   # Grok OAuth self-refresh
-│   ├── JWT.swift                  # Local JWT payload/expiry decoding
-│   ├── KeychainManager.swift      # File-based token storage
+│   ├── KimiUsageParser.swift      # Kimi usages response (resetAt, 5h + weekly)
 │   ├── KimiService.swift          # Kimi Code credentials + usages API
-│   ├── OpenAIService.swift        # Codex CLI usage API
-│   ├── ProcessRunner.swift        # External command runner (ps, lsof, sqlite3)
-│   ├── RateLimiter.swift          # Per-provider 429 backoff
-│   ├── ServiceError.swift         # Shared service error type
-│   ├── TimeFormatter.swift        # Reset countdown formatting
-│   ├── TokenCache.swift           # In-memory credential cache
-│   └── UsageService.swift         # Provider service protocol
+│   ├── UsageSnapshotStore.swift   # SQLite last-synced usage cache
+│   └── …
 └── Resources/              # Provider SVG icons
+Tests/LLMitsCheck/          # Parser + snapshot assertions (`swift run LLMitsCheck`)
 ```
 
 ## Debug Logging

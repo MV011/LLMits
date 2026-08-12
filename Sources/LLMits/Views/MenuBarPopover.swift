@@ -7,7 +7,7 @@ enum PopoverPage {
     case addAccount
 }
 
-struct MenuBarPopover: View {
+public struct MenuBarPopover: View {
     @EnvironmentObject var dashboardVM: UsageDashboardViewModel
     @EnvironmentObject var accountsVM: AccountsViewModel
     @State private var currentPage: PopoverPage = .dashboard
@@ -15,7 +15,9 @@ struct MenuBarPopover: View {
     /// KeychainManager.load does disk I/O + JSON parse on every call.
     @State private var tokenPresence: [UUID: Bool] = [:]
 
-    var body: some View {
+    public init() {}
+
+    public var body: some View {
         VStack(spacing: 0) {
             switch currentPage {
             case .dashboard:
@@ -123,9 +125,11 @@ struct MenuBarPopover: View {
 
             HStack(spacing: 12) {
                 if let last = dashboardVM.lastRefreshed {
-                    Text("Updated \(last.formatted(.relative(presentation: .named)))")
-                        .font(.system(size: 10, design: .rounded))
-                        .foregroundStyle(.quaternary)
+                    TimelineView(.periodic(from: .now, by: 15)) { _ in
+                        Text("Updated \(last.formatted(.relative(presentation: .named)))")
+                            .font(.system(size: 10, design: .rounded))
+                            .foregroundStyle(.quaternary)
+                    }
                 }
 
                 Spacer()

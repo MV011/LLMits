@@ -188,14 +188,14 @@ struct AnthropicService: UsageService {
 
             let percent = (entry["percent"] as? Double) ?? (entry["percent"] as? Int).map(Double.init) ?? 0
             let windowSeconds = isWeekly ? TimeFormatter.weeklySeconds : TimeFormatter.fiveHourSeconds
-            let (adjusted, detail) = TimeFormatter.adjustForStaleReset(
+            let (adjusted, resetAt) = TimeFormatter.resolveWindow(
                 percentUsed: percent / 100.0,
                 resetDateString: entry["resets_at"] as? String,
                 windowSeconds: windowSeconds
             )
 
             groups.append(UsageGroup(name: name, limits: [
-                UsageLimit(name: name, percentUsed: adjusted, detail: detail, windowType: windowType)
+                UsageLimit(name: name, percentUsed: adjusted, resetAt: resetAt, windowType: windowType)
             ]))
         }
 
@@ -212,19 +212,19 @@ struct AnthropicService: UsageService {
         // Try "utilization" field
         if let utilization = window["utilization"] as? Double {
             let normalized = utilization > 1.0 ? utilization / 100.0 : utilization
-            let (adjusted, detail) = TimeFormatter.adjustForStaleReset(
+            let (adjusted, resetAt) = TimeFormatter.resolveWindow(
                 percentUsed: normalized, resetDateString: resetStr, windowSeconds: windowSeconds
             )
-            debugLog("[Anthropic]   '\(name)' result: raw=\(normalized) adjusted=\(adjusted) detail=\(detail ?? "nil")")
-            return UsageLimit(name: name, percentUsed: adjusted, detail: detail, windowType: windowType)
+            debugLog("[Anthropic]   '\(name)' result: raw=\(normalized) adjusted=\(adjusted) resetAt=\(resetAt as Any)")
+            return UsageLimit(name: name, percentUsed: adjusted, resetAt: resetAt, windowType: windowType)
         }
 
         // Try "percent_used" / "percentUsed"
         if let pctUsed = window["percent_used"] as? Double ?? window["percentUsed"] as? Double {
-            let (adjusted, detail) = TimeFormatter.adjustForStaleReset(
+            let (adjusted, resetAt) = TimeFormatter.resolveWindow(
                 percentUsed: pctUsed / 100.0, resetDateString: resetStr, windowSeconds: windowSeconds
             )
-            return UsageLimit(name: name, percentUsed: adjusted, detail: detail, windowType: windowType)
+            return UsageLimit(name: name, percentUsed: adjusted, resetAt: resetAt, windowType: windowType)
         }
 
         return nil

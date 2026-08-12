@@ -11,12 +11,12 @@ struct ProviderSection: View {
 
     /// Priority 1: weekly limit exhausted
     private var isWeeklyExhausted: Bool {
-        allLimits.contains { $0.windowType == .weekly && $0.percentUsed >= 1.0 }
+        allLimits.contains { $0.windowType == .weekly && $0.percentUsed(at: Date()) >= 1.0 }
     }
 
     /// Priority 2: 5-hour window exhausted
     private var isFiveHourExhausted: Bool {
-        allLimits.contains { $0.windowType == .fiveHour && $0.percentUsed >= 1.0 }
+        allLimits.contains { $0.windowType == .fiveHour && $0.percentUsed(at: Date()) >= 1.0 }
     }
 
     /// For multi-model providers (Antigravity): Gemini Pro AND Cloud both exhausted
@@ -34,15 +34,15 @@ struct ProviderSection: View {
     }
 
     /// Reset detail for the exhausted limit
-    private var exhaustedResetDetail: String? {
+    private var exhaustedResetLimit: UsageLimit? {
         if isWeeklyExhausted {
-            return allLimits.first { $0.windowType == .weekly && $0.percentUsed >= 1.0 }?.detail
+            return allLimits.first { $0.windowType == .weekly && $0.percentUsed(at: Date()) >= 1.0 }
         }
         if isFiveHourExhausted {
-            return allLimits.first { $0.windowType == .fiveHour && $0.percentUsed >= 1.0 }?.detail
+            return allLimits.first { $0.windowType == .fiveHour && $0.percentUsed(at: Date()) >= 1.0 }
         }
         if isAllPinnedExhausted {
-            return (allLimits.first { $0.name == "Cloud" && $0.percentUsed >= 1.0 })?.detail
+            return allLimits.first { $0.name == "Cloud" && $0.percentUsed(at: Date()) >= 1.0 }
         }
         return nil
     }
@@ -119,18 +119,35 @@ struct ProviderSection: View {
 
     @ViewBuilder
     private var collapsedBadge: some View {
-        if isAtLimit, let resetDetail = exhaustedResetDetail {
-            // Limit exhausted — show reset countdown in red
-            HStack(spacing: 3) {
-                Image(systemName: "exclamationmark.circle.fill")
-                    .font(.system(size: 8))
-                Text(resetDetail.replacingOccurrences(of: "Resets in ", with: ""))
-                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+        if isAtLimit, let resetLimit = exhaustedResetLimit {
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                let text = resetLimit.resetDetail(at: context.date)?
+                    .replacingOccurrences(of: "Resets in ", with: "") ?? "reset"
+                HStack(spacing: 3) {
+                    Image(systemName: "exclamationmark.circle.fill")
+                        .font(.system(size: 8))
+                    Text(text)
+                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                }
+                .foregroundStyle(.red)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 3)
+                .background(Capsule().fill(Color.red.opacity(0.12)))
             }
-            .foregroundStyle(.red)
-            .padding(.horizontal, 7)
-            .padding(.vertical, 3)
-            .background(Capsule().fill(Color.red.opacity(0.12)))
+        } else if provider == .kimi {
+            let weekly = allLimits.first { $0.windowType == .weekly }
+            let fiveH = allLimits.first { $0.windowType == .fiveHour }
+            HStack(spacing: 4) {
+                if let fiveH {
+                    miniLimitBadge(label: "5h", limit: fiveH)
+                }
+                if let weekly {
+                    miniLimitBadge(label: "Wk", limit: weekly)
+                }
+                if weekly == nil && fiveH == nil, let first = allLimits.first {
+                    percentBadge(remaining: Int(first.percentRemaining(at: Date()) * 100), color: first.limitColor)
+                }
+            }
         } else if provider == .antigravity {
             // Show Pro + Flash usage (direct API) or Pro + Cloud (language server)
             let proLimit = allLimits.first { $0.name == "Pro" || $0.name == "Gemini Pro" }
@@ -166,11 +183,9 @@ struct ProviderSection: View {
                 }
             }
         } else if let fiveH = fiveHourLimit {
-            percentBadge(remaining: Int(fiveH.percentRemaining * 100), color: fiveH.limitColor)
-        } else {
-            let maxUsed = allLimits.map(\.percentUsed).max() ?? 0
-            let maxLimit = allLimits.first { $0.percentUsed == maxUsed }
-            percentBadge(remaining: Int((1.0 - maxUsed) * 100), color: maxLimit?.limitColor ?? .green)
+            livePercentBadge(limit: fiveH)
+        } else if let first = allLimits.max(by: { $0.percentUsed(at: Date()) < $1.percentUsed(at: Date()) }) {
+            livePercentBadge(limit: first)
         }
     }
 
@@ -256,6 +271,15 @@ struct ProviderSection: View {
         }
     }
 
+    private func livePercentBadge(limit: UsageLimit) -> some View {
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            percentBadge(
+                remaining: Int(limit.percentRemaining(at: context.date) * 100),
+                color: limit.limitColor(at: context.date)
+            )
+        }
+    }
+
     private func percentBadge(remaining: Int, color: Color) -> some View {
         Text("\(remaining)% left")
             .font(.system(size: 9, weight: .bold, design: .monospaced))
@@ -281,19 +305,21 @@ struct ProviderSection: View {
     }
 
     private func miniLimitBadge(label: String, limit: UsageLimit) -> some View {
-        let remaining = Int(limit.percentRemaining * 100)
-
-        return HStack(spacing: 2) {
-            Text(label)
-                .font(.system(size: 8, weight: .medium, design: .rounded))
-                .foregroundStyle(limit.limitColor.opacity(0.7))
-            Text("\(remaining)%")
-                .font(.system(size: 9, weight: .bold, design: .monospaced))
-                .foregroundStyle(limit.limitColor)
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            let remaining = Int(limit.percentRemaining(at: context.date) * 100)
+            let color = limit.limitColor(at: context.date)
+            HStack(spacing: 2) {
+                Text(label)
+                    .font(.system(size: 8, weight: .medium, design: .rounded))
+                    .foregroundStyle(color.opacity(0.7))
+                Text("\(remaining)%")
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .foregroundStyle(color)
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(Capsule().fill(color.opacity(0.12)))
         }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 3)
-        .background(Capsule().fill(limit.limitColor.opacity(0.12)))
     }
 }
 

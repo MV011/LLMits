@@ -389,17 +389,13 @@ struct AntigravityService: UsageService {
                 .flatMap(TimeFormatter.parseISO8601)
                 .map { $0.timeIntervalSinceNow > 24 * 3600 } ?? false
             let windowType: UsageLimit.WindowType = isWeekly ? .weekly : .fiveHour
-            let (adjustedUsed, resetDetail) = TimeFormatter.adjustForStaleReset(
+            let (adjustedUsed, resetAt) = TimeFormatter.resolveWindow(
                 percentUsed: 1.0 - rep.remainingFraction,
                 resetDateString: rep.resetTime,
                 windowSeconds: isWeekly ? TimeFormatter.weeklySeconds : TimeFormatter.fiveHourSeconds
             )
             let modelsStr = models.map(\.label).joined(separator: ", ")
-            var detail = modelsStr
-            if let rd = resetDetail, !rd.isEmpty {
-                detail = "\(modelsStr) · \(rd)"
-            }
-            return UsageLimit(name: name, percentUsed: adjustedUsed, detail: detail, windowType: windowType)
+            return UsageLimit(name: name, percentUsed: adjustedUsed, detail: modelsStr, resetAt: resetAt, windowType: windowType)
         }
 
         if let l = buildLSLimit(name: "Gemini Pro", models: geminiPro) { limits.append(l) }
@@ -543,21 +539,17 @@ struct AntigravityService: UsageService {
             ? TimeFormatter.weeklySeconds
             : TimeFormatter.fiveHourSeconds
 
-        let (adjustedUsed, resetDetail) = TimeFormatter.adjustForStaleReset(
+        let (adjustedUsed, resetAt) = TimeFormatter.resolveWindow(
             percentUsed: 1.0 - remaining,
             resetDateString: resetStr,
             windowSeconds: windowSeconds
         )
 
-        var detail = bucket["description"] as? String
-        if let rd = resetDetail, !rd.isEmpty {
-            detail = detail.map { "\($0) · \(rd)" } ?? rd
-        }
-
         return UsageLimit(
             name: displayName,
             percentUsed: adjustedUsed,
-            detail: detail,
+            detail: bucket["description"] as? String,
+            resetAt: resetAt,
             windowType: windowType
         )
     }

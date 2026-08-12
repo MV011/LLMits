@@ -38,10 +38,12 @@ cp "$BINARY" "$APP_DIR/Contents/MacOS/$APP_NAME"
 # Copy Info.plist
 cp "Info.plist" "$APP_DIR/Contents/"
 
-# Copy resources (SVGs, etc.) — Swift PM bundles them, but we also want them accessible
-if [ -d ".build/$CONFIG/LLMits_LLMits.bundle" ]; then
-    cp -R ".build/$CONFIG/LLMits_LLMits.bundle" "$APP_DIR/Contents/Resources/"
-fi
+# Copy SwiftPM resource bundles (icons live on LLMitsCore).
+shopt -s nullglob
+for bundle in ".build/$CONFIG/"*LLMits*.bundle; do
+    cp -R "$bundle" "$APP_DIR/Contents/Resources/"
+done
+shopt -u nullglob
 
 # Code-sign with entitlements (seals Info.plist + binary together).
 # Prefer the stable self-signed "LLMits Local Signing" identity — it lets macOS

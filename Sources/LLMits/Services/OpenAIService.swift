@@ -239,7 +239,7 @@ struct OpenAIService: UsageService {
         guard let window else { return nil }
 
         let usedPct = window["used_percent"] as? Double ?? 0
-        let resetText = TimeFormatter.formatResetTime(
+        let resetAt = TimeFormatter.parseResetDate(
             epochOrSeconds: window["reset_at"] as? Double ?? window["reset_after_seconds"] as? Double,
             isEpoch: window["reset_at"] != nil
         )
@@ -247,7 +247,7 @@ struct OpenAIService: UsageService {
         return UsageLimit(
             name: name,
             percentUsed: min(usedPct / 100.0, 1.0),
-            detail: resetText,
+            resetAt: resetAt,
             windowType: windowType
         )
     }

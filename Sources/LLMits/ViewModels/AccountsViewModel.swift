@@ -3,7 +3,7 @@ import SwiftUI
 import Security
 
 @MainActor
-class AccountsViewModel: ObservableObject {
+public class AccountsViewModel: ObservableObject {
     @Published var accounts: [Account] = [] {
         didSet { saveAccounts() }
     }
@@ -18,7 +18,7 @@ class AccountsViewModel: ObservableObject {
         Set(UserDefaults.standard.stringArray(forKey: tombstonedProvidersKey) ?? [])
     }
 
-    init() {
+    public init() {
         loadAccounts()
     }
 

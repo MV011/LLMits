@@ -1,6 +1,6 @@
 import SwiftUI
 
-enum Provider: String, Codable, CaseIterable, Identifiable {
+public enum Provider: String, Codable, CaseIterable, Identifiable {
     case anthropic
     case openai
     case antigravity
@@ -8,7 +8,7 @@ enum Provider: String, Codable, CaseIterable, Identifiable {
     case grok
     case kimi
 
-    var id: String { rawValue }
+    public var id: String { rawValue }
 
     var displayName: String {
         switch self {

@@ -302,7 +302,7 @@ struct CursorService: UsageService {
             planName = formatPlanName(membershipType)
         }
 
-        let resetSuffix = billingResetSuffix(summary: summary, planInfoObj: planInfoObj)
+        let resetAt = billingResetDate(summary: summary, planInfoObj: planInfoObj)
         let autoMessage = summary["autoModelSelectedDisplayMessage"] as? String
         let apiMessage = summary["namedModelSelectedDisplayMessage"] as? String
 
@@ -318,7 +318,8 @@ struct CursorService: UsageService {
                 limits.append(UsageLimit(
                     name: "Auto + Composer",
                     percentUsed: auto / 100.0,
-                    detail: composeDetail(message: autoMessage, resetSuffix: resetSuffix),
+                    detail: composeDetail(message: autoMessage, resetSuffix: nil),
+                    resetAt: resetAt,
                     windowType: .monthly,
                     percentDisplay: .used
                 ))
@@ -329,6 +330,7 @@ struct CursorService: UsageService {
                     name: "API",
                     percentUsed: api / 100.0,
                     detail: composeDetail(message: apiMessage, resetSuffix: nil),
+                    resetAt: resetAt,
                     windowType: .monthly,
                     percentDisplay: .used
                 ))
@@ -340,7 +342,8 @@ struct CursorService: UsageService {
                     limits.append(UsageLimit(
                         name: "Included",
                         percentUsed: total / 100.0,
-                        detail: composeDetail(message: autoMessage, resetSuffix: resetSuffix),
+                        detail: composeDetail(message: autoMessage, resetSuffix: nil),
+                        resetAt: resetAt,
                         windowType: .monthly,
                         percentDisplay: .used
                     ))
@@ -349,12 +352,11 @@ struct CursorService: UsageService {
                     let limit = planUsage["limit"] as? Int ?? 0
                     if limit > 0 {
                         let pct = min(Double(used) / Double(limit), 1.0)
-                        var detail = "\(formatCents(used)) / \(formatCents(limit)) included"
-                        if let resetSuffix { detail += " · \(resetSuffix)" }
                         limits.append(UsageLimit(
                             name: "Included",
                             percentUsed: pct,
-                            detail: detail,
+                            detail: "\(formatCents(used)) / \(formatCents(limit)) included",
+                            resetAt: resetAt,
                             windowType: .monthly
                         ))
                     }
@@ -367,7 +369,7 @@ struct CursorService: UsageService {
             appendCentsLimit(
                 name: "Personal Cap",
                 usage: overall,
-                resetSuffix: resetSuffix,
+                resetAt: resetAt,
                 into: &limits
             )
         }
@@ -378,7 +380,7 @@ struct CursorService: UsageService {
             appendCentsLimit(
                 name: "Team Pool",
                 usage: pooled,
-                resetSuffix: resetSuffix,
+                resetAt: resetAt,
                 into: &limits
             )
         }
@@ -437,17 +439,14 @@ struct CursorService: UsageService {
         return v
     }
 
-    private func billingResetSuffix(summary: [String: Any], planInfoObj: [String: Any]?) -> String? {
+    private func billingResetDate(summary: [String: Any], planInfoObj: [String: Any]?) -> Date? {
         if let endStr = summary["billingCycleEnd"] as? String,
-           let endDate = TimeFormatter.parseISO8601(endStr), endDate > Date(),
-           let remaining = TimeFormatter.formatRemaining(endDate.timeIntervalSinceNow) {
-            return remaining
+           let endDate = TimeFormatter.parseISO8601(endStr), endDate > Date() {
+            return endDate
         }
         if let endMs = (planInfoObj?["billingCycleEnd"] as? String).flatMap({ Double($0) }) {
             let endDate = Date(timeIntervalSince1970: endMs / 1000)
-            if endDate > Date(), let remaining = TimeFormatter.formatRemaining(endDate.timeIntervalSinceNow) {
-                return remaining
-            }
+            if endDate > Date() { return endDate }
         }
         return nil
     }
@@ -462,19 +461,18 @@ struct CursorService: UsageService {
     private func appendCentsLimit(
         name: String,
         usage: [String: Any],
-        resetSuffix: String?,
+        resetAt: Date?,
         into limits: inout [UsageLimit]
     ) {
         let used = usage["used"] as? Int ?? 0
         let limit = usage["limit"] as? Int ?? 0
         guard limit > 0 else { return }
         let pct = min(Double(used) / Double(limit), 1.0)
-        var detail = "\(formatCents(used)) / \(formatCents(limit))"
-        if let resetSuffix { detail += " · \(resetSuffix)" }
         limits.append(UsageLimit(
             name: name,
             percentUsed: pct,
-            detail: detail,
+            detail: "\(formatCents(used)) / \(formatCents(limit))",
+            resetAt: resetAt,
             windowType: .monthly
         ))
     }

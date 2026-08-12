@@ -1,13 +1,13 @@
 import Foundation
 
-enum ServiceError: LocalizedError {
+public enum ServiceError: LocalizedError {
     case noCredentials(String)
     case httpError(Int)
     case invalidResponse
     case parseError(String)
     case processNotFound(String)
 
-    var errorDescription: String? {
+    public var errorDescription: String? {
         switch self {
         case .noCredentials(let msg): return msg
         case .httpError(let code):
