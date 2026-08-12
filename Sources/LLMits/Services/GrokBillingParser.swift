@@ -49,17 +49,13 @@ public enum GrokBillingParser {
         let windowType = TimeFormatter.windowType(fromPeriodType: period?["type"] as? String)
         let resolvedType: UsageLimit.WindowType = windowType == .unknown ? .weekly : windowType
 
-        let rawPercent = JSONNumber.double(from: config["creditUsagePercent"])
         let productUsage = config["productUsage"] as? [[String: Any]] ?? []
-        // Unified billing sends a 0...∞ fraction of the weekly pool (1.0 = 100%,
-        // 2.0 = 200% overage). Do not treat values like 2.0 as "2 percent".
-        let poolPercent: Double = {
-            if let rawPercent {
-                return min(max(rawPercent, 0), 1.0)
-            }
-            let maxProduct = productUsage.compactMap { JSONNumber.double(from: $0["usagePercent"]) }.max() ?? 0
-            return min(max(maxProduct, 0), 1.0)
-        }()
+        // Unified `creditUsagePercent` is 0...100 (CLI logs for SuperGrok Heavy
+        // are 1.0 / 2.0 / 3.0). Treating 2.0 as a 0...1 fraction made the bar
+        // read 0% left. Divide by 100; values above 100 are overage.
+        let rawPercent = JSONNumber.double(from: config["creditUsagePercent"])
+            ?? productUsage.compactMap { JSONNumber.double(from: $0["usagePercent"]) }.max()
+        let poolPercent = Self.creditsPercentUsed(rawPercent)
 
         let (adjusted, reset) = TimeFormatter.resolveWindow(
             percentUsed: poolPercent,
@@ -67,10 +63,15 @@ public enum GrokBillingParser {
             windowSeconds: TimeFormatter.weeklySeconds
         )
 
-        var poolDetail: String?
-        if productUsage.count == 1, let only = productUsage.first {
-            poolDetail = friendlyProduct(only["product"] as? String)
+        var poolParts: [String] = []
+        if productUsage.count == 1, let only = productUsage.first,
+           let product = friendlyProduct(only["product"] as? String) {
+            poolParts.append(product)
         }
+        if let rawPercent {
+            poolParts.append(String(format: "%.0f%% used", rawPercent))
+        }
+        let poolDetail = poolParts.isEmpty ? nil : poolParts.joined(separator: " · ")
 
         limits.append(UsageLimit(
             name: "Weekly Usage",
@@ -84,7 +85,7 @@ public enum GrokBillingParser {
             for entry in productUsage {
                 let name = friendlyProduct(entry["product"] as? String) ?? "Product"
                 let raw = JSONNumber.double(from: entry["usagePercent"]) ?? 0
-                let pct = min(max(raw, 0), 1.0)
+                let pct = Self.creditsPercentUsed(raw)
                 limits.append(UsageLimit(
                     name: name,
                     percentUsed: pct,
@@ -127,11 +128,10 @@ public enum GrokBillingParser {
                 windowType: resolvedType
             ))
         } else if let pct = JSONNumber.double(from: creditsConfig["creditUsagePercent"]) {
-            let normalized = pct > 1.0 ? pct / 100.0 : pct
             limits.append(UsageLimit(
                 name: "Build Credits",
-                percentUsed: min(normalized, 1.0),
-                detail: nil,
+                percentUsed: Self.creditsPercentUsed(pct),
+                detail: String(format: "%.0f%% used", pct),
                 resetAt: resetAt,
                 windowType: resolvedType
             ))
@@ -185,6 +185,13 @@ public enum GrokBillingParser {
 
     private static func periodDict(_ config: [String: Any]) -> [String: Any]? {
         config["currentPeriod"] as? [String: Any]
+    }
+
+    /// `creditUsagePercent` / `usagePercent` on the credits endpoint are
+    /// 0...100 (2.0 = 2% of the weekly pool), not 0...1 fractions.
+    static func creditsPercentUsed(_ value: Double?) -> Double {
+        guard let value else { return 0 }
+        return min(max(value / 100.0, 0), 1.0)
     }
 
     static func friendlyProduct(_ raw: String?) -> String? {

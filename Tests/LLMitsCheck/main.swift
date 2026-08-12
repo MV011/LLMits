@@ -50,11 +50,11 @@ do {
     expect(limits.contains { $0.windowType == .weekly }, "expected weekly window")
     expect(!limits.contains { $0.windowType == .monthly && $0.name == "Build Credits" }, "must not label weekly pool as monthly Build Credits")
     let weekly = limits.first { $0.name == "Weekly Usage" }
-    expect(weekly?.percentUsed == 1.0, "weekly percent")
+    expect(abs((weekly?.percentUsed ?? -1) - 0.01) < 0.0001, "1.0 from API is 1% used")
 }
 
 do {
-    // Overage is reported as 2.0 (= 200% of the pool), not 2%.
+    // Live SuperGrok Heavy payload: 2.0 means 2% of the weekly pool, not 200%.
     let credits = fixture([
         "config": [
             "currentPeriod": ["type": "USAGE_PERIOD_TYPE_WEEKLY", "end": "2026-08-14T10:54:53Z"],
@@ -65,7 +65,8 @@ do {
     ])
     let weekly = try GrokBillingParser.parse(credits: credits, plain: fixture(["config": [:]]))[0]
         .limits.first { $0.name == "Weekly Usage" }
-    expect(weekly?.percentUsed == 1.0, "overage fraction caps at 100%, is not treated as 2%")
+    expect(abs((weekly?.percentUsed ?? -1) - 0.02) < 0.0001, "2.0 from API is 2% used")
+    expect(weekly?.detail?.contains("2% used") == true, "detail shows 2% used")
     expect(weekly?.resetAt != nil, "weekly resetAt")
     if let reset = weekly?.resetAt {
         expect(Calendar.current.component(.day, from: reset) == 14, "reset day")
@@ -80,11 +81,11 @@ do {
                 "type": "USAGE_PERIOD_TYPE_WEEKLY",
                 "end": "2026-08-14T10:54:53.882335+00:00"
             ],
-            "creditUsagePercent": 0.6,
+            "creditUsagePercent": 60.0,
             "isUnifiedBillingUser": true,
             "productUsage": [
-                ["product": "GrokBuild", "usagePercent": 0.4],
-                ["product": "GrokChat", "usagePercent": 0.2]
+                ["product": "GrokBuild", "usagePercent": 40.0],
+                ["product": "GrokChat", "usagePercent": 20.0]
             ]
         ]
     ])
