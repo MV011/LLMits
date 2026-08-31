@@ -41,7 +41,7 @@ public struct UsageLimit: Identifiable, Codable, Equatable {
         return percentUsed
     }
 
-    func percentRemaining(at date: Date) -> Double {
+    public func percentRemaining(at date: Date) -> Double {
         1.0 - percentUsed(at: date)
     }
 

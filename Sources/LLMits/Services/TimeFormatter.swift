@@ -128,6 +128,26 @@ public enum TimeFormatter {
 
     // MARK: - Formatting
 
+    /// Compact countdown for pills: "5d 12h", "1h 30m", "12m", or "<1m".
+    public static func formatCompactRemaining(_ seconds: TimeInterval) -> String? {
+        guard seconds > 0 else { return nil }
+
+        let totalSeconds = Int(seconds)
+        let days = totalSeconds / 86400
+        let hours = (totalSeconds % 86400) / 3600
+        let minutes = (totalSeconds % 3600) / 60
+
+        if days > 0 {
+            return "\(days)d \(hours)h"
+        } else if hours > 0 {
+            return "\(hours)h \(minutes)m"
+        } else if minutes > 0 {
+            return "\(minutes)m"
+        } else {
+            return "<1m"
+        }
+    }
+
     /// Format seconds remaining as "Resets in Xd Yh Zm", "Resets in Yh Zm", "Resets in Zm", or "Resets in <1m".
     static func formatRemaining(_ seconds: TimeInterval) -> String? {
         guard seconds > 0 else { return nil }

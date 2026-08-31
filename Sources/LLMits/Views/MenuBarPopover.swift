@@ -7,10 +7,16 @@ enum PopoverPage {
     case addAccount
 }
 
+enum DashboardPane {
+    case live
+    case cached
+}
+
 public struct MenuBarPopover: View {
     @EnvironmentObject var dashboardVM: UsageDashboardViewModel
     @EnvironmentObject var accountsVM: AccountsViewModel
     @State private var currentPage: PopoverPage = .dashboard
+    @State private var dashboardPane: DashboardPane = .live
     /// Token presence per account, hoisted out of view-body renders —
     /// KeychainManager.load does disk I/O + JSON parse on every call.
     @State private var tokenPresence: [UUID: Bool] = [:]
@@ -99,8 +105,20 @@ public struct MenuBarPopover: View {
                 .frame(height: 1.5)
                 .padding(.horizontal, 12)
 
+            Picker("Pane", selection: $dashboardPane) {
+                Text("Live").tag(DashboardPane.live)
+                Text("Cached").tag(DashboardPane.cached)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .controlSize(.small)
+            .padding(.horizontal, 12)
+            .padding(.top, 8)
+
             // Content
-            if accountsVM.accounts.isEmpty {
+            if dashboardPane == .cached {
+                RosterView()
+            } else if accountsVM.accounts.isEmpty {
                 emptyState
             } else {
                 ScrollView(.vertical, showsIndicators: false) {

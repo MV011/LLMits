@@ -24,6 +24,7 @@ A lightweight macOS menu bar app that tracks your AI coding tool usage and limit
 - **Red alerts** — cards turn red when limits are exhausted, with countdown timers
 - **Auto-refresh** — usage data refreshes every 10 minutes; countdowns tick locally from the last synced reset time
 - **Last-synced cache** — last API snapshot is stored in `~/Library/Application Support/LLMits/usage.sqlite` so the popover opens with the previous numbers immediately
+- **Cached identities** — Claude and Codex percentages are kept per logged-in email, so switching CLI accounts does not lose the previous user's weekly pills. Open the **Cached** tab to compare who to switch to next (5-hour Claude pill only when that window is exhausted)
 - **Token refresh** — self-refreshes expired OAuth tokens (Grok, Antigravity); Claude tokens are refreshed by Claude Code itself and re-read from the Keychain
 - **Native macOS** — lightweight SwiftUI menu bar app, no Electron
 
@@ -90,7 +91,7 @@ If auto-discovery doesn't work, click **"+ Add Account"** in the popover to manu
 Sources/LLMitsApp/          # @main menu-bar entry (depends on LLMitsCore)
 Sources/LLMits/             # LLMitsCore library
 ├── Models/                 # Account, Provider, UsageLimit (resetAt), UsageGroup
-├── Views/                  # MenuBarPopover, ProviderSection, live countdown rows
+├── Views/                  # MenuBarPopover, ProviderSection, Cached roster, live countdown rows
 ├── ViewModels/             # AccountsViewModel, UsageDashboardViewModel
 ├── Services/               # API services per provider + last-synced SQLite cache
 │   ├── GrokBillingParser.swift    # Unified weekly + legacy monthly billing

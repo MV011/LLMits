@@ -6,7 +6,12 @@ import SQLite3
 /// The dashboard hydrates from this on launch so the popover shows the last
 /// synced API status immediately, and live countdowns can tick from stored
 /// `resetAt` timestamps without waiting for a network round-trip.
-public struct UsageSnapshot: Codable, Equatable {
+///
+/// Identity-keyed copies (`identity_snapshots`) keep the last percentages
+/// after a CLI account switch, so the Cached roster can show every user
+/// that has been fetched on this Mac.
+public struct UsageSnapshot: Codable, Equatable, Identifiable {
+    public var id: String { "\(provider.rawValue)|\(identity ?? accountID.uuidString)" }
     public var accountID: UUID
     public var provider: Provider
     public var fetchedAt: Date
@@ -101,31 +106,44 @@ public final class UsageSnapshotStore: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard openIfNeeded() else { return }
+        writeAccountSnapshotUnlocked(snapshot)
+        writeIdentitySnapshotUnlocked(snapshot, replace: true)
+    }
 
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        encoder.outputFormatting = [.sortedKeys]
-        guard let data = try? encoder.encode(snapshot),
-              let json = String(data: data, encoding: .utf8) else { return }
+    public func loadIdentities(providers: [Provider]? = nil) -> [UsageSnapshot] {
+        lock.lock()
+        defer { lock.unlock() }
+        guard openIfNeeded() else { return [] }
 
-        let sql = """
-        INSERT INTO snapshots (account_id, provider, fetched_at, payload)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(account_id) DO UPDATE SET
-            provider = excluded.provider,
-            fetched_at = excluded.fetched_at,
-            payload = excluded.payload;
-        """
+        let sql = "SELECT payload FROM identity_snapshots;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(stmt) }
+
+        var result: [UsageSnapshot] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if let snap = decodePayload(stmt, column: 0) {
+                result.append(snap)
+            }
+        }
+        if let providers {
+            let allowed = Set(providers)
+            result = result.filter { allowed.contains($0.provider) }
+        }
+        return result
+    }
+
+    public func deleteIdentity(provider: Provider, identity: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard openIfNeeded() else { return }
+        let sql = "DELETE FROM identity_snapshots WHERE provider = ? AND identity = ?;"
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
         defer { sqlite3_finalize(stmt) }
-        sqlite3_bind_text(stmt, 1, snapshot.accountID.uuidString, -1, SQLITE_TRANSIENT)
-        sqlite3_bind_text(stmt, 2, snapshot.provider.rawValue, -1, SQLITE_TRANSIENT)
-        sqlite3_bind_double(stmt, 3, snapshot.fetchedAt.timeIntervalSince1970)
-        sqlite3_bind_text(stmt, 4, json, -1, SQLITE_TRANSIENT)
-        if sqlite3_step(stmt) != SQLITE_DONE {
-            debugLog("[Snapshot] save failed: \(String(cString: sqlite3_errmsg(db)))")
-        }
+        sqlite3_bind_text(stmt, 1, provider.rawValue, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 2, identity, -1, SQLITE_TRANSIENT)
+        sqlite3_step(stmt)
     }
 
     func delete(accountID: UUID) {
@@ -157,12 +175,108 @@ public final class UsageSnapshotStore: @unchecked Sendable {
             fetched_at REAL NOT NULL,
             payload TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS identity_snapshots (
+            provider TEXT NOT NULL,
+            identity TEXT NOT NULL,
+            account_id TEXT,
+            fetched_at REAL NOT NULL,
+            payload TEXT NOT NULL,
+            PRIMARY KEY (provider, identity)
+        );
         """
         if sqlite3_exec(db, schema, nil, nil, nil) != SQLITE_OK {
             debugLog("[Snapshot] schema failed")
             return false
         }
+        backfillIdentitiesUnlocked()
         return true
+    }
+
+    private func writeAccountSnapshotUnlocked(_ snapshot: UsageSnapshot) {
+        guard let json = encode(snapshot) else { return }
+        let sql = """
+        INSERT INTO snapshots (account_id, provider, fetched_at, payload)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(account_id) DO UPDATE SET
+            provider = excluded.provider,
+            fetched_at = excluded.fetched_at,
+            payload = excluded.payload;
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, snapshot.accountID.uuidString, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 2, snapshot.provider.rawValue, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_double(stmt, 3, snapshot.fetchedAt.timeIntervalSince1970)
+        sqlite3_bind_text(stmt, 4, json, -1, SQLITE_TRANSIENT)
+        if sqlite3_step(stmt) != SQLITE_DONE {
+            debugLog("[Snapshot] save failed: \(String(cString: sqlite3_errmsg(db)))")
+        }
+    }
+
+    /// Persist last-known-good usage for this CLI identity. Empty groups on
+    /// error must not wipe a previous good roster row.
+    private func writeIdentitySnapshotUnlocked(_ snapshot: UsageSnapshot, replace: Bool) {
+        guard let identity = snapshot.identity?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !identity.isEmpty else { return }
+        if snapshot.groups.isEmpty { return }
+        guard let json = encode(snapshot) else { return }
+
+        let sql: String
+        if replace {
+            sql = """
+            INSERT INTO identity_snapshots (provider, identity, account_id, fetched_at, payload)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(provider, identity) DO UPDATE SET
+                account_id = excluded.account_id,
+                fetched_at = excluded.fetched_at,
+                payload = excluded.payload;
+            """
+        } else {
+            sql = """
+            INSERT OR IGNORE INTO identity_snapshots (provider, identity, account_id, fetched_at, payload)
+            VALUES (?, ?, ?, ?, ?);
+            """
+        }
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, snapshot.provider.rawValue, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 2, identity, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 3, snapshot.accountID.uuidString, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_double(stmt, 4, snapshot.fetchedAt.timeIntervalSince1970)
+        sqlite3_bind_text(stmt, 5, json, -1, SQLITE_TRANSIENT)
+        if sqlite3_step(stmt) != SQLITE_DONE {
+            debugLog("[Snapshot] identity save failed: \(String(cString: sqlite3_errmsg(db)))")
+        }
+    }
+
+    private func backfillIdentitiesUnlocked() {
+        let sql = "SELECT payload FROM snapshots;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(stmt) }
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if let snap = decodePayload(stmt, column: 0) {
+                writeIdentitySnapshotUnlocked(snap, replace: false)
+            }
+        }
+    }
+
+    private func encode(_ snapshot: UsageSnapshot) -> String? {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(snapshot) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    private func decodePayload(_ stmt: OpaquePointer?, column: Int32) -> UsageSnapshot? {
+        guard let stmt, let cString = sqlite3_column_text(stmt, column) else { return nil }
+        let data = Data(bytes: cString, count: Int(sqlite3_column_bytes(stmt, column)))
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try? decoder.decode(UsageSnapshot.self, from: data)
     }
 }
 

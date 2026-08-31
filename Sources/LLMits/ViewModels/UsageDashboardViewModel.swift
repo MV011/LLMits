@@ -18,6 +18,9 @@ public class UsageDashboardViewModel: ObservableObject {
     @Published var accountUsages: [AccountUsageData] = []
     @Published var isRefreshing = false
     @Published var lastRefreshed: Date?
+    /// Last-known usage per Claude / Codex identity, including accounts that
+    /// are not currently logged in.
+    @Published var rosterSnapshots: [UsageSnapshot] = []
 
     public init() {}
 
@@ -246,6 +249,7 @@ public class UsageDashboardViewModel: ObservableObject {
         if lastRefreshed == nil {
             lastRefreshed = snaps.values.map(\.fetchedAt).max()
         }
+        reloadRoster()
     }
 
     private func persistSnapshot(_ usage: AccountUsageData) {
@@ -258,6 +262,17 @@ public class UsageDashboardViewModel: ObservableObject {
             groups: usage.groups,
             error: usage.error
         ))
+        reloadRoster()
+    }
+
+    func reloadRoster() {
+        rosterSnapshots = snapshotStore.loadIdentities(providers: [.anthropic, .openai])
+    }
+
+    func deleteRosterIdentity(_ snapshot: UsageSnapshot) {
+        guard let identity = snapshot.identity, !identity.isEmpty else { return }
+        snapshotStore.deleteIdentity(provider: snapshot.provider, identity: identity)
+        reloadRoster()
     }
 
     private func startPeriodicRefresh() {
