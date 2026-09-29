@@ -132,7 +132,7 @@ struct RosterView: View {
         if let limit = pill.limit {
             switch pill.kind {
             case .remainingPercent:
-                let remaining = Int(limit.percentRemaining(at: date) * 100)
+                let remaining = limit.remainingPercentage(at: date)
                 LimitCapsule(
                     label: pill.label,
                     text: "\(remaining)%",

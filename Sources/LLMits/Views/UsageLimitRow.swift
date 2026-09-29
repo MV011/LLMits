@@ -16,9 +16,11 @@ struct UsageLimitRow: View {
         let percentLabel: String = {
             switch limit.percentDisplay {
             case .remaining:
-                return "\(Int(limit.percentRemaining(at: date) * 100))% left"
+                return "\(limit.remainingPercentage(at: date))% left"
             case .used:
                 return "\(Int(used * 100))%"
+            case .none:
+                return ""
             }
         }()
 
@@ -33,24 +35,26 @@ struct UsageLimitRow: View {
                     .foregroundStyle(barColor)
             }
 
-            GeometryReader { geo in
-                ZStack(alignment: .leading) {
-                    RoundedRectangle(cornerRadius: 3)
-                        .fill(Color.primary.opacity(0.06))
+            if limit.percentDisplay != .none {
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        RoundedRectangle(cornerRadius: 3)
+                            .fill(Color.primary.opacity(0.06))
 
-                    RoundedRectangle(cornerRadius: 3)
-                        .fill(
-                            LinearGradient(
-                                colors: [barColor.opacity(0.6), barColor],
-                                startPoint: .leading,
-                                endPoint: .trailing
+                        RoundedRectangle(cornerRadius: 3)
+                            .fill(
+                                LinearGradient(
+                                    colors: [barColor.opacity(0.6), barColor],
+                                    startPoint: .leading,
+                                    endPoint: .trailing
+                                )
                             )
-                        )
-                        .frame(width: max(2, geo.size.width * used))
-                        .animation(.spring(duration: 0.5), value: used)
+                            .frame(width: max(2, geo.size.width * used))
+                            .animation(.spring(duration: 0.5), value: used)
+                    }
                 }
+                .frame(height: 6)
             }
-            .frame(height: 6)
 
             HStack(spacing: 4) {
                 if !limit.windowType.rawValue.isEmpty {

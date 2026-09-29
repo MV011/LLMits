@@ -6,7 +6,7 @@ struct ProviderSection: View {
     @State private var isExpanded = false
 
     private var allLimits: [UsageLimit] {
-        usages.flatMap { $0.groups.flatMap(\.limits) }
+        usages.flatMap { $0.groups.flatMap(\.limits) }.filter { $0.percentDisplay != .none }
     }
 
     /// Priority 1: weekly limit exhausted
@@ -145,7 +145,7 @@ struct ProviderSection: View {
                     miniLimitBadge(label: "Wk", limit: weekly)
                 }
                 if weekly == nil && fiveH == nil, let first = allLimits.first {
-                    percentBadge(remaining: Int(first.percentRemaining(at: Date()) * 100), color: first.limitColor)
+                    percentBadge(remaining: first.remainingPercentage(at: Date()), color: first.limitColor)
                 }
             }
         } else if provider == .antigravity {
@@ -165,7 +165,7 @@ struct ProviderSection: View {
                     miniLimitBadge(label: "Cloud", limit: cloud)
                 }
                 if proLimit == nil && flashLimit == nil && cloudLimit == nil, let first = allLimits.first {
-                    percentBadge(remaining: Int(first.percentRemaining * 100), color: first.limitColor)
+                    percentBadge(remaining: first.remainingPercentage(at: Date()), color: first.limitColor)
                 }
             }
         } else if provider == .cursor {
@@ -179,7 +179,7 @@ struct ProviderSection: View {
                     cursorUsedBadge(label: "API", limit: api)
                 }
                 if auto == nil && api == nil, let first = allLimits.first {
-                    percentBadge(remaining: Int(first.percentRemaining * 100), color: first.limitColor)
+                    percentBadge(remaining: first.remainingPercentage(at: Date()), color: first.limitColor)
                 }
             }
         } else if let fiveH = fiveHourLimit {
@@ -274,7 +274,7 @@ struct ProviderSection: View {
     private func livePercentBadge(limit: UsageLimit) -> some View {
         TimelineView(.periodic(from: .now, by: 1)) { context in
             percentBadge(
-                remaining: Int(limit.percentRemaining(at: context.date) * 100),
+                remaining: limit.remainingPercentage(at: context.date),
                 color: limit.limitColor(at: context.date)
             )
         }
@@ -306,7 +306,7 @@ struct ProviderSection: View {
 
     private func miniLimitBadge(label: String, limit: UsageLimit) -> some View {
         TimelineView(.periodic(from: .now, by: 1)) { context in
-            let remaining = Int(limit.percentRemaining(at: context.date) * 100)
+            let remaining = limit.remainingPercentage(at: context.date)
             let color = limit.limitColor(at: context.date)
             HStack(spacing: 2) {
                 Text(label)
@@ -322,4 +322,3 @@ struct ProviderSection: View {
         }
     }
 }
-
