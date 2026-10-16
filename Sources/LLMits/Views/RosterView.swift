@@ -33,7 +33,7 @@ struct RosterView: View {
                 .foregroundStyle(.secondary)
             Text("No cached accounts yet")
                 .font(.system(size: 13, weight: .semibold, design: .rounded))
-            Text("Use Claude or Codex, then switch.\nLast percentages stay here.")
+            Text("Use Claude or Codex, then switch.\nLast usage and reset times stay here.")
                 .font(.system(size: 11, design: .rounded))
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -94,26 +94,34 @@ struct RosterView: View {
             }
 
             TimelineView(.periodic(from: .now, by: 1)) { context in
-                let pills = RosterPills.pills(for: provider, groups: snap.groups, at: context.date)
+                let pills = RosterPills.pills(
+                    for: provider, groups: snap.groups, at: context.date, fetchedAt: snap.fetchedAt
+                )
                 VStack(alignment: .leading, spacing: 4) {
-                    HStack(spacing: 4) {
+                    Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 4) {
                         ForEach(Array(pills.enumerated()), id: \.offset) { _, pill in
-                            pillView(pill, at: context.date)
+                            GridRow {
+                                pillView(pill, at: context.date)
+                                Text(pill.resetDescription(at: context.date))
+                                    .font(.system(size: 9, design: .rounded))
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            .accessibilityElement(children: .combine)
+                            .help(pill.limit?.resetAt.map {
+                                "Reset: \($0.formatted(date: .abbreviated, time: .shortened))"
+                            } ?? "No reset time in this snapshot")
                         }
                     }
-                    if pills.contains(where: { $0.kind == .fiveHourExhausted }) {
-                        Text("exhausted \(snap.fetchedAt.formatted(.relative(presentation: .named)))")
-                            .font(.system(size: 9, design: .rounded))
-                            .foregroundStyle(.red.opacity(0.8))
-                    }
+
+                    Text(live
+                         ? "updated \(snap.fetchedAt.formatted(.relative(presentation: .named)))"
+                         : "cached \(snap.fetchedAt.formatted(.relative(presentation: .named)))")
+                        .font(.system(size: 9, design: .rounded))
+                        .foregroundStyle(.quaternary)
+                        .help(snap.fetchedAt.formatted(date: .abbreviated, time: .shortened))
                 }
             }
-
-            Text(live
-                 ? "updated \(snap.fetchedAt.formatted(.relative(presentation: .named)))"
-                 : "cached \(snap.fetchedAt.formatted(.relative(presentation: .named)))")
-                .font(.system(size: 9, design: .rounded))
-                .foregroundStyle(.quaternary)
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
@@ -135,28 +143,23 @@ struct RosterView: View {
                 let remaining = limit.remainingPercentage(at: date)
                 LimitCapsule(
                     label: pill.label,
-                    text: "\(remaining)%",
+                    text: "\(remaining)% left",
                     color: limit.limitColor(at: date)
                 )
-            case .resetCountdown:
+            case .resetPassed:
                 LimitCapsule(
-                    label: nil,
-                    text: compactCountdown(limit, at: date) ?? "reset",
+                    label: pill.label,
+                    text: "reset",
                     color: Color.primary.opacity(0.55)
                 )
             case .fiveHourExhausted:
                 LimitCapsule(
-                    label: "5h",
-                    text: compactCountdown(limit, at: date) ?? "maxed",
+                    label: pill.label,
+                    text: "maxed",
                     color: .red
                 )
             }
         }
-    }
-
-    private func compactCountdown(_ limit: UsageLimit, at date: Date) -> String? {
-        guard let resetAt = limit.resetAt else { return nil }
-        return TimeFormatter.formatCompactRemaining(resetAt.timeIntervalSince(date))
     }
 
     private func isLive(_ snap: UsageSnapshot) -> Bool {
