@@ -25,7 +25,8 @@ swift build -c $CONFIG 2>&1
 
 APP_NAME="LLMits"
 APP_DIR="$APP_NAME.app"
-BINARY=".build/$CONFIG/$APP_NAME"
+BINARY_DIR="$(swift build -c "$CONFIG" --show-bin-path)"
+BINARY="$BINARY_DIR/$APP_NAME"
 
 echo "📦 Creating $APP_DIR..."
 rm -rf "$APP_DIR"
@@ -40,7 +41,7 @@ cp "Info.plist" "$APP_DIR/Contents/"
 
 # Copy SwiftPM resource bundles (icons live on LLMitsCore).
 shopt -s nullglob
-for bundle in ".build/$CONFIG/"*LLMits*.bundle; do
+for bundle in "$BINARY_DIR/"*LLMits*.bundle; do
     cp -R "$bundle" "$APP_DIR/Contents/Resources/"
 done
 shopt -u nullglob

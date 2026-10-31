@@ -20,6 +20,11 @@ let package = Package(
                 .swiftLanguageMode(.v5)
             ]
         ),
+        .testTarget(
+            name: "LLMitsCoreTests",
+            dependencies: ["LLMitsCore"],
+            path: "Tests/LLMitsCoreTests"
+        ),
         .executableTarget(
             name: "LLMits",
             dependencies: ["LLMitsCore"],

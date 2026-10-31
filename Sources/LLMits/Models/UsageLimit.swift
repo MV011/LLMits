@@ -11,6 +11,7 @@ public struct UsageLimit: Identifiable, Codable, Equatable {
     public let resetAt: Date?             // absolute window end; countdown is derived live
     public let windowType: WindowType
     /// `.remaining` shows "62% left" (Anthropic/OpenAI). `.used` shows "38%" like Cursor's dashboard.
+    /// `.none` displays a balance without a percentage or progress bar.
     public let percentDisplay: PercentDisplay
 
     public init(
@@ -32,6 +33,8 @@ public struct UsageLimit: Identifiable, Codable, Equatable {
     public enum PercentDisplay: String, Codable, Equatable {
         case remaining
         case used
+        /// A balance has no known percentage denominator.
+        case none
     }
 
     /// If the stored reset has already passed, treat the window as unused
@@ -43,6 +46,12 @@ public struct UsageLimit: Identifiable, Codable, Equatable {
 
     public func percentRemaining(at date: Date) -> Double {
         1.0 - percentUsed(at: date)
+    }
+
+    /// Round once for display so a reported 77% used stays 23% remaining,
+    /// even when floating-point subtraction produces 22.999999999999996.
+    public func remainingPercentage(at date: Date) -> Int {
+        Int((percentRemaining(at: date) * 100).rounded())
     }
 
     var percentRemaining: Double { 1.0 - percentUsed }

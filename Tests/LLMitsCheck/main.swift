@@ -18,12 +18,13 @@ func fixture(_ object: [String: Any]) -> Data {
 // MARK: - Grok
 
 do {
+    let resetTime = Date().addingTimeInterval(3 * 86400).ISO8601Format()
     let credits = fixture([
         "config": [
             "currentPeriod": [
                 "type": "USAGE_PERIOD_TYPE_WEEKLY",
                 "start": "2026-08-07T10:54:53.882335+00:00",
-                "end": "2026-10-14T10:54:53.882335+00:00"
+                "end": resetTime
             ],
             "creditUsagePercent": 1.0,
             "onDemandCap": ["val": 0],
@@ -34,7 +35,7 @@ do {
             "isUnifiedBillingUser": true,
             "prepaidBalance": ["val": 0],
             "billingPeriodStart": "2026-08-07T10:54:53.882335+00:00",
-            "billingPeriodEnd": "2026-10-14T10:54:53.882335+00:00"
+            "billingPeriodEnd": resetTime
         ]
     ])
     let plain = fixture([
@@ -56,9 +57,10 @@ do {
 
 do {
     // Live SuperGrok Heavy payload: 2.0 means 2% of the weekly pool, not 200%.
+    let resetAt = Date().addingTimeInterval(3 * 86400)
     let credits = fixture([
         "config": [
-            "currentPeriod": ["type": "USAGE_PERIOD_TYPE_WEEKLY", "end": "2026-10-14T10:54:53Z"],
+            "currentPeriod": ["type": "USAGE_PERIOD_TYPE_WEEKLY", "end": resetAt.ISO8601Format()],
             "creditUsagePercent": 2.0,
             "isUnifiedBillingUser": true,
             "productUsage": [["product": "GrokBuild", "usagePercent": 2.0]]
@@ -70,8 +72,8 @@ do {
     expect(weekly?.detail?.contains("2% used") == true, "detail shows 2% used")
     expect(weekly?.resetAt != nil, "weekly resetAt")
     if let reset = weekly?.resetAt {
-        expect(Calendar.current.component(.day, from: reset) == 14, "reset day")
-        expect(Calendar.current.component(.month, from: reset) == 10, "reset month")
+        expect(Calendar.current.component(.day, from: reset) == Calendar.current.component(.day, from: resetAt), "reset day")
+        expect(Calendar.current.component(.month, from: reset) == Calendar.current.component(.month, from: resetAt), "reset month")
     }
 }
 
@@ -139,20 +141,21 @@ do {
 // MARK: - Kimi
 
 do {
+    let now = Date()
     let json: [String: Any] = [
         "limits": [[
             "window": ["duration": 300, "timeUnit": "TIME_UNIT_MINUTE"],
             "detail": [
                 "limit": "100",
                 "remaining": "100",
-                "resetTime": "2026-10-13T00:00:42.846726Z"
+                "resetTime": now.addingTimeInterval(3 * 3600).ISO8601Format()
             ]
         ]],
         "usage": [
             "limit": "100",
             "used": "25",
             "remaining": "75",
-            "resetTime": "2026-10-14T10:00:42.846726Z"
+            "resetTime": now.addingTimeInterval(3 * 86400).ISO8601Format()
         ]
     ]
     let groups = KimiUsageParser.parse(json)
@@ -160,7 +163,7 @@ do {
     expect(fiveH?.percentUsed == 0, "5h unused")
     expect(fiveH?.resetAt != nil, "5h resetAt even when unused")
     expect(fiveH?.windowType == .fiveHour, "5h type")
-    expect(fiveH?.resetDetail(at: Date(timeIntervalSince1970: 1_786_567_979)) != nil, "5h countdown")
+    expect(fiveH?.resetDetail(at: now) != nil, "5h countdown")
 
     let weekly = groups.first { $0.name == "Kimi — Weekly" }?.limits.first
     expect(abs((weekly?.percentUsed ?? -1) - 0.25) < 0.001, "weekly 25%")
@@ -386,7 +389,7 @@ do {
     let pills = RosterPills.pills(for: .anthropic, groups: groups, at: now)
     expect(pills.contains { $0.label == "Wk" && $0.kind == .remainingPercent }, "claude weekly pill")
     expect(pills.contains { $0.label == "Fable" && $0.kind == .remainingPercent }, "claude fable pill")
-    expect(!pills.contains { $0.kind == .fiveHourExhausted }, "5h hidden when unused")
+    expect(pills.contains { $0.label == "5h" && $0.kind == .remainingPercent }, "unused 5h remains visible")
     let wk = pills.first { $0.label == "Wk" }
     expect(wk?.limit?.percentRemaining(at: now) == 0.4, "wk remaining 40%")
 }
@@ -402,7 +405,8 @@ do {
     expect(pills.contains { $0.kind == .fiveHourExhausted }, "5h shown when exhausted")
     let later = now.addingTimeInterval(2 * 3600)
     let afterReset = RosterPills.pills(for: .anthropic, groups: groups, at: later)
-    expect(!afterReset.contains { $0.kind == .fiveHourExhausted }, "5h hidden after local reset")
+    expect(!afterReset.contains { $0.kind == .fiveHourExhausted }, "5h no longer exhausted after reset")
+    expect(afterReset.contains { $0.label == "5h" && $0.kind == .resetPassed }, "expired 5h needs a refresh")
 }
 
 do {
@@ -418,7 +422,8 @@ do {
     ]
     let pills = RosterPills.pills(for: .openai, groups: groups, at: now)
     expect(pills.contains { $0.label == "Wk" && $0.kind == .remainingPercent }, "codex weekly from long-reset primary")
-    expect(pills.contains { $0.kind == .resetCountdown }, "codex reset timer")
+    expect(pills.first { $0.label == "Wk" }?.resetDescription(at: now) == "resets in 6d 0h", "codex reset timer")
+    expect(!pills.contains { $0.label == "5h" }, "legacy weekly window is not duplicated as 5h")
     expect(!pills.contains { $0.label.lowercased().contains("spark") }, "spark ignored")
     let wk = pills.first { $0.label == "Wk" }
     expect(abs((wk?.limit?.percentUsed ?? -1) - 0.09) < 0.0001, "codex uses main window not spark")

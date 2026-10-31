@@ -98,7 +98,7 @@ struct AnthropicService: UsageService {
 
     // MARK: - Response Parsing
 
-    private func parseUsageResponse(_ data: Data) throws -> [UsageGroup] {
+    func parseUsageResponse(_ data: Data) throws -> [UsageGroup] {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw ServiceError.parseError("Invalid JSON response")
         }

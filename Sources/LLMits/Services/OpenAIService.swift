@@ -3,7 +3,6 @@ import Foundation
 /// Fetches OpenAI Codex / ChatGPT usage via OAuth tokens from the Codex CLI.
 struct OpenAIService: UsageService {
     private static let providerKey = "openai"
-    private let usageURL = URL(string: "https://chatgpt.com/backend-api/wham/usage")!
 
     func fetchUsage(token: String) async throws -> [UsageGroup] {
         if RateLimiter.shared.isLimited(Self.providerKey) {
@@ -13,10 +12,7 @@ struct OpenAIService: UsageService {
         var accessToken = try await resolveAccessToken(manualToken: token)
 
         do {
-            var request = URLRequest(url: usageURL)
-            request.httpMethod = "GET"
-            request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-            request.timeoutInterval = 15
+            let request = usageRequest(accessToken: accessToken)
 
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let httpResponse = response as? HTTPURLResponse else {
@@ -51,10 +47,7 @@ struct OpenAIService: UsageService {
 
             accessToken = try await resolveAccessToken(manualToken: token, forceFresh: true)
 
-            var request = URLRequest(url: usageURL)
-            request.httpMethod = "GET"
-            request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-            request.timeoutInterval = 15
+            let request = usageRequest(accessToken: accessToken)
 
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let httpResponse = response as? HTTPURLResponse else {
@@ -79,6 +72,42 @@ struct OpenAIService: UsageService {
     }
 
     // MARK: - Token Resolution
+
+    private func usageRequest(accessToken: String) -> URLRequest {
+        Self.usageRequest(
+            accessToken: accessToken,
+            accountID: Self.accountID(for: accessToken, authJSON: Self.readAuthJSON())
+        )
+    }
+
+    static func usageRequest(accessToken: String, accountID: String?) -> URLRequest {
+        var request = URLRequest(url: URL(string: "https://chatgpt.com/backend-api/wham/usage")!)
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        if let accountID, !accountID.isEmpty {
+            request.setValue(accountID, forHTTPHeaderField: "ChatGPT-Account-Id")
+        }
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.timeoutInterval = 15
+        return request
+    }
+
+    /// Keep the routing hint paired with the selected token, including manual
+    /// tokens and cached credentials from before a CLI account switch.
+    static func accountID(for accessToken: String, authJSON: [String: Any]?) -> String? {
+        let tokens = authJSON?["tokens"] as? [String: Any] ?? authJSON
+        if let storedToken = tokens?["access_token"] as? String ?? tokens?["accessToken"] as? String,
+           storedToken == accessToken,
+           let accountID = tokens?["account_id"] as? String,
+           !accountID.isEmpty {
+            return accountID
+        }
+        let auth = JWT.payload(accessToken)?["https://api.openai.com/auth"] as? [String: Any]
+        guard let accountID = auth?["chatgpt_account_id"] as? String, !accountID.isEmpty else {
+            return nil
+        }
+        return accountID
+    }
 
     private func resolveAccessToken(manualToken: String, forceFresh: Bool = false) async throws -> String {
         if manualToken != "mock-token" && manualToken != "mock" && !manualToken.isEmpty {
@@ -171,7 +200,7 @@ struct OpenAIService: UsageService {
 
     // MARK: - Response Parsing
 
-    private func parseUsageResponse(_ data: Data) throws -> [UsageGroup] {
+    func parseUsageResponse(_ data: Data) throws -> [UsageGroup] {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw ServiceError.parseError("Invalid JSON response")
         }
@@ -180,7 +209,7 @@ struct OpenAIService: UsageService {
 
         // Main rate limit
         if let rateLimit = json["rate_limit"] as? [String: Any] {
-            groups += parseRateLimitBlock(rateLimit, namePrefix: "Codex")
+            groups += try parseRateLimitBlock(rateLimit, namePrefix: "Codex")
         }
 
         // Additional rate limits (Spark, etc.)
@@ -188,90 +217,104 @@ struct OpenAIService: UsageService {
             for entry in additional {
                 let name = entry["limit_name"] as? String ?? "Unknown"
                 if let rl = entry["rate_limit"] as? [String: Any] {
-                    groups += parseRateLimitBlock(rl, namePrefix: name)
+                    groups += try parseRateLimitBlock(rl, namePrefix: name)
                 }
             }
         }
 
         // Code review rate limit
         if let codeReview = json["code_review_rate_limit"] as? [String: Any] {
-            if let limit = parseRateWindow(codeReview["primary_window"] as? [String: Any],
+            if let limit = try parseRateWindow(codeReview["primary_window"] as? [String: Any],
                                            name: "Code Review", windowType: .unknown) {
                 groups.append(UsageGroup(name: "Code Review", limits: [limit]))
             }
         }
 
         // Credits / balance
-        if let credits = json["credits"] as? [String: Any] {
-            groups.append(parseCredits(credits))
+        if let credits = json["credits"] as? [String: Any], let group = parseCredits(credits) {
+            groups.append(group)
         }
 
         if groups.isEmpty {
-            let planType = json["plan_type"] as? String ?? "unknown"
-            groups.append(UsageGroup(name: "Codex (\(planType))", limits: [
-                UsageLimit(name: "Connected", percentUsed: 0,
-                           detail: json["email"] as? String ?? "No usage data", windowType: .unknown)
-            ]))
+            throw ServiceError.parseError("No usage data in OpenAI response")
         }
 
         return groups
     }
 
     /// Parses a rate_limit block with primary + secondary windows.
-    private func parseRateLimitBlock(_ block: [String: Any], namePrefix: String) -> [UsageGroup] {
+    private func parseRateLimitBlock(_ block: [String: Any], namePrefix: String) throws -> [UsageGroup] {
         var groups: [UsageGroup] = []
 
-        if let limit = parseRateWindow(block["primary_window"] as? [String: Any],
-                                       name: "\(namePrefix) 5h Limit", windowType: .fiveHour) {
-            groups.append(UsageGroup(name: "\(namePrefix) — 5h", limits: [limit]))
-        }
-
-        if let limit = parseRateWindow(block["secondary_window"] as? [String: Any],
-                                       name: "\(namePrefix) Weekly", windowType: .weekly) {
-            groups.append(UsageGroup(name: "\(namePrefix) — Weekly", limits: [limit]))
+        for (key, fallback) in [("primary_window", UsageLimit.WindowType.fiveHour),
+                                ("secondary_window", UsageLimit.WindowType.weekly)] {
+            guard let window = block[key] as? [String: Any] else { continue }
+            let type: UsageLimit.WindowType
+            if let seconds = JSONNumber.double(from: window["limit_window_seconds"]) {
+                switch seconds {
+                case TimeFormatter.fiveHourSeconds: type = .fiveHour
+                case TimeFormatter.weeklySeconds: type = .weekly
+                case 86400: type = .daily
+                default: type = .unknown
+                }
+            } else {
+                type = fallback
+            }
+            let label: String
+            switch type {
+            case .fiveHour: label = "5h"
+            case .unknown: label = key == "primary_window" ? "Primary" : "Secondary"
+            default: label = type.rawValue
+            }
+            let limitName = type == .fiveHour ? "\(namePrefix) 5h Limit" : "\(namePrefix) \(label)"
+            if let limit = try parseRateWindow(window, name: limitName, windowType: type) {
+                groups.append(UsageGroup(name: "\(namePrefix) — \(label)", limits: [limit]))
+            }
         }
 
         return groups
     }
 
     /// Parses a single rate window (primary or secondary) into a UsageLimit.
-    private func parseRateWindow(_ window: [String: Any]?, name: String, windowType: UsageLimit.WindowType) -> UsageLimit? {
+    private func parseRateWindow(_ window: [String: Any]?, name: String, windowType: UsageLimit.WindowType) throws -> UsageLimit? {
         guard let window else { return nil }
 
-        let usedPct = window["used_percent"] as? Double ?? 0
+        guard let usedPct = JSONNumber.double(from: window["used_percent"]), usedPct.isFinite else {
+            throw ServiceError.parseError("Missing or invalid OpenAI usage percentage")
+        }
+        let epoch = JSONNumber.double(from: window["reset_at"]).flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+        let seconds = JSONNumber.double(from: window["reset_after_seconds"]).flatMap { $0.isFinite && $0 >= 0 ? $0 : nil }
         let resetAt = TimeFormatter.parseResetDate(
-            epochOrSeconds: window["reset_at"] as? Double ?? window["reset_after_seconds"] as? Double,
-            isEpoch: window["reset_at"] != nil
+            epochOrSeconds: epoch ?? seconds,
+            isEpoch: epoch != nil
         )
 
         return UsageLimit(
             name: name,
-            percentUsed: min(usedPct / 100.0, 1.0),
+            percentUsed: min(max(usedPct / 100.0, 0), 1.0),
             resetAt: resetAt,
             windowType: windowType
         )
     }
 
     /// Parses the credits/balance section.
-    private func parseCredits(_ credits: [String: Any]) -> UsageGroup {
-        let balanceStr = credits["balance"] as? String ?? "0"
-        let balance = Double(balanceStr) ?? 0
-        let hasCredits = credits["has_credits"] as? Bool ?? false
+    private func parseCredits(_ credits: [String: Any]) -> UsageGroup? {
+        let balance = JSONNumber.double(from: credits["balance"])
         let unlimited = credits["unlimited"] as? Bool ?? false
 
         let detail: String
         if unlimited {
             detail = "Unlimited"
-        } else if hasCredits || balance > 0 {
-            detail = String(format: "$%.2f remaining", balance)
+        } else if let balance, balance.isFinite, balance >= 0 {
+            detail = String(format: "Balance: %g", balance)
         } else {
-            detail = "$0.00 remaining"
+            return nil
         }
 
         return UsageGroup(name: "Credits", limits: [
             UsageLimit(name: "Credit Balance",
-                       percentUsed: (unlimited || balance > 0) ? 0 : 1.0,
-                       detail: detail, windowType: .monthly)
+                       percentUsed: 0,
+                       detail: detail, windowType: .unknown, percentDisplay: .none)
         ])
     }
 }
