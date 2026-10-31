@@ -6,6 +6,13 @@ struct RosterView: View {
     private let rosterProviders: [Provider] = [.anthropic, .openai]
 
     var body: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            roster(at: context.date)
+        }
+    }
+
+    @ViewBuilder
+    private func roster(at date: Date) -> some View {
         let grouped = Dictionary(grouping: dashboardVM.rosterSnapshots, by: \.provider)
         if dashboardVM.rosterSnapshots.isEmpty {
             emptyState
@@ -13,9 +20,9 @@ struct RosterView: View {
             ScrollView(.vertical, showsIndicators: false) {
                 LazyVStack(spacing: 8) {
                     ForEach(rosterProviders) { provider in
-                        let snaps = sorted(grouped[provider] ?? [])
+                        let snaps = RosterOrdering.sorted(grouped[provider] ?? [], at: date)
                         if !snaps.isEmpty {
-                            providerBlock(provider, snaps: snaps)
+                            providerBlock(provider, snaps: snaps, at: date)
                         }
                     }
                 }
@@ -42,7 +49,7 @@ struct RosterView: View {
         .frame(maxWidth: .infinity)
     }
 
-    private func providerBlock(_ provider: Provider, snaps: [UsageSnapshot]) -> some View {
+    private func providerBlock(_ provider: Provider, snaps: [UsageSnapshot], at date: Date) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
                 provider.icon
@@ -50,18 +57,25 @@ struct RosterView: View {
                 Text(provider.displayName)
                     .font(.system(size: 11, weight: .semibold, design: .rounded))
                     .foregroundStyle(.secondary)
+                Spacer()
+                Text(provider == .anthropic ? "Available first · soonest weekly reset" : "Available first · earliest reset")
+                    .font(.system(size: 9, design: .rounded))
+                    .foregroundStyle(.secondary)
             }
             .padding(.leading, 4)
             .padding(.top, 2)
 
             ForEach(snaps) { snap in
-                identityRow(snap, provider: provider)
+                identityRow(snap, provider: provider, at: date)
             }
         }
     }
 
-    private func identityRow(_ snap: UsageSnapshot, provider: Provider) -> some View {
+    private func identityRow(_ snap: UsageSnapshot, provider: Provider, at date: Date) -> some View {
         let live = isLive(snap)
+        let pills = RosterPills.pills(
+            for: provider, groups: snap.groups, at: date, fetchedAt: snap.fetchedAt
+        )
         return VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
                 Text(snap.identity ?? snap.accountID.uuidString)
@@ -93,34 +107,32 @@ struct RosterView: View {
                 }
             }
 
-            TimelineView(.periodic(from: .now, by: 1)) { context in
-                let pills = RosterPills.pills(
-                    for: provider, groups: snap.groups, at: context.date, fetchedAt: snap.fetchedAt
-                )
-                VStack(alignment: .leading, spacing: 4) {
-                    Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 4) {
-                        ForEach(Array(pills.enumerated()), id: \.offset) { _, pill in
-                            GridRow {
-                                pillView(pill, at: context.date)
-                                Text(pill.resetDescription(at: context.date))
-                                    .font(.system(size: 9, design: .rounded))
-                                    .foregroundStyle(.secondary)
-                                    .fixedSize(horizontal: false, vertical: true)
+            VStack(alignment: .leading, spacing: 4) {
+                Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 4) {
+                    ForEach(Array(pills.enumerated()), id: \.offset) { _, pill in
+                        GridRow {
+                            pillView(pill, at: date)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(pill.resetDescription(at: date))
+                                if let resetDate = pill.resetDateDescription(at: date) {
+                                    Text(resetDate)
+                                }
                             }
-                            .accessibilityElement(children: .combine)
-                            .help(pill.limit?.resetAt.map {
-                                "Reset: \($0.formatted(date: .abbreviated, time: .shortened))"
-                            } ?? "No reset time in this snapshot")
+                            .font(.system(size: 9, design: .rounded))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                         }
+                        .accessibilityElement(children: .combine)
+                        .help(pill.resetHelp(at: date))
                     }
-
-                    Text(live
-                         ? "updated \(snap.fetchedAt.formatted(.relative(presentation: .named)))"
-                         : "cached \(snap.fetchedAt.formatted(.relative(presentation: .named)))")
-                        .font(.system(size: 9, design: .rounded))
-                        .foregroundStyle(.quaternary)
-                        .help(snap.fetchedAt.formatted(date: .abbreviated, time: .shortened))
                 }
+
+                Text((live ? "updated " : "cached ")
+                     + snap.fetchedAt.formatted(.relative(presentation: .named))
+                     + (pills.contains { $0.kind == .resetPassed } ? " · ≈ usage estimated after reset" : ""))
+                    .font(.system(size: 9, design: .rounded))
+                    .foregroundStyle(.secondary)
+                    .help(snap.fetchedAt.formatted(date: .abbreviated, time: .shortened))
             }
         }
         .padding(.horizontal, 10)
@@ -149,8 +161,8 @@ struct RosterView: View {
             case .resetPassed:
                 LimitCapsule(
                     label: pill.label,
-                    text: "reset",
-                    color: Color.primary.opacity(0.55)
+                    text: "≈100% left",
+                    color: .green
                 )
             case .fiveHourExhausted:
                 LimitCapsule(
@@ -167,15 +179,6 @@ struct RosterView: View {
         return dashboardVM.accountUsages.contains { usage in
             usage.account.provider == snap.provider
                 && usage.identity?.localizedCaseInsensitiveCompare(identity) == .orderedSame
-        }
-    }
-
-    private func sorted(_ snaps: [UsageSnapshot]) -> [UsageSnapshot] {
-        snaps.sorted { a, b in
-            let liveA = isLive(a)
-            let liveB = isLive(b)
-            if liveA != liveB { return liveA && !liveB }
-            return a.fetchedAt > b.fetchedAt
         }
     }
 }

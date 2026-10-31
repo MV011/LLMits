@@ -36,7 +36,7 @@ struct RosterResetTests {
     }
 
     @Test(arguments: ["anthropic", "openai"], ["5-hour", "Weekly"])
-    func expiredSnapshotRequestsRefresh(providerName: String, windowName: String) throws {
+    func expiredSnapshotShowsReadinessWithoutChangingStoredUsage(providerName: String, windowName: String) throws {
         let provider = try #require(Provider(rawValue: providerName))
         let type = try #require(UsageLimit.WindowType(rawValue: windowName))
         let resetAt = now.addingTimeInterval(60)
@@ -45,8 +45,17 @@ struct RosterResetTests {
         #expect(before.resetDescription(at: now.addingTimeInterval(30)) == "resets in <1m")
         let expired = try #require(RosterPills.pills(for: provider, groups: groups, at: resetAt).first)
         #expect(expired.kind == .resetPassed)
-        #expect(expired.resetDescription(at: resetAt) == "reset passed · refresh to update")
+        if provider == .anthropic && type == .weekly {
+            #expect(expired.resetDescription(at: resetAt) == "ready · next reset in 7d 0h (est.)")
+            #expect(expired.nextReset(at: resetAt) == resetAt.addingTimeInterval(7 * 86400))
+        } else {
+            #expect(expired.resetDescription(at: resetAt) == "ready · refresh to confirm")
+            #expect(expired.nextReset(at: resetAt) == nil)
+        }
         #expect(expired.limit?.percentUsed == 0.25)
+        #expect(expired.limit?.remainingPercentage(at: resetAt) == 100)
+        #expect(expired.resetDateDescription(at: resetAt) != nil)
+        #expect(expired.resetHelp(at: resetAt).contains("estimated"))
     }
 
     @Test(arguments: ["anthropic", "openai"], ["5-hour", "Weekly"])
@@ -57,6 +66,8 @@ struct RosterResetTests {
         let pill = try #require(RosterPills.pills(for: provider, groups: groups, at: now).first)
         #expect(pill.kind == .remainingPercent)
         #expect(pill.resetDescription(at: now) == "reset time unavailable")
+        #expect(pill.nextReset(at: now) == nil)
+        #expect(pill.resetDateDescription(at: now) == nil)
     }
 
     @Test func codexSessionDoesNotRequireWeeklyData() {
@@ -95,5 +106,27 @@ struct RosterResetTests {
         let expired = RosterPills.pills(for: .openai, groups: groups, at: resetAt, fetchedAt: now)
         #expect(expired.map(\.label) == ["Wk"])
         #expect(expired.first?.kind == .resetPassed)
+        #expect(expired.first?.nextReset(at: resetAt) == nil)
+    }
+
+    @Test func idleClaudeAccountKeepsWeeklyCadenceAcrossManyCycles() throws {
+        let recorded = now.addingTimeInterval(-24 * 86400)
+        let groups = [group(.anthropic, type: .weekly, resetAt: recorded)]
+        let pill = try #require(RosterPills.pills(for: .anthropic, groups: groups, at: now).first)
+        let next = now.addingTimeInterval(4 * 86400)
+        #expect(pill.nextReset(at: now) == next)
+        #expect(pill.resetDescription(at: now) == "ready · next reset in 4d 0h (est.)")
+        #expect(pill.nextReset(at: next) == next.addingTimeInterval(7 * 86400))
+        #expect(pill.limit?.resetAt == recorded)
+        #expect(pill.resetDateDescription(at: now)?.hasPrefix("Next:") == true)
+    }
+
+    @Test func codexAndSessionsKeepTheRecordedReadyDate() throws {
+        let recorded = now.addingTimeInterval(-24 * 86400)
+        let groups = [group(.openai, type: .weekly, resetAt: recorded)]
+        let pill = try #require(RosterPills.pills(for: .openai, groups: groups, at: now).first)
+        #expect(pill.nextReset(at: now) == nil)
+        #expect(pill.resetDateDescription(at: now)?.hasPrefix("Ready since:") == true)
+        #expect(pill.limit?.resetAt == recorded)
     }
 }
