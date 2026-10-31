@@ -34,7 +34,7 @@ public struct MenuBarPopover: View {
                 addAccountView
             }
         }
-        .frame(width: 360, height: 520)
+        .frame(width: 390, height: 560)
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {
             updateTokenPresence()
@@ -62,13 +62,8 @@ public struct MenuBarPopover: View {
                 Image(systemName: "gauge.with.dots.needle.33percent")
                     .font(.system(size: 16, weight: .semibold))
                     .foregroundStyle(.blue)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("LLMits")
-                        .font(.system(size: 14, weight: .bold, design: .rounded))
-                    Text("AI Usage Tracker")
-                        .font(.system(size: 10, weight: .medium, design: .rounded))
-                        .foregroundStyle(.secondary)
-                }
+                Text("LLMits")
+                    .font(.system(size: 16, weight: .semibold, design: .rounded))
 
                 Spacer()
 
@@ -87,33 +82,22 @@ public struct MenuBarPopover: View {
                         )
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("Refresh usage")
                 .help("Refresh all")
             }
             .padding(.horizontal, 16)
             .padding(.top, 14)
             .padding(.bottom, 10)
 
-            // Thin accent line
-            Rectangle()
-                .fill(
-                    LinearGradient(
-                        colors: [.blue.opacity(0.6), .purple.opacity(0.4), .clear],
-                        startPoint: .leading,
-                        endPoint: .trailing
-                    )
-                )
-                .frame(height: 1.5)
-                .padding(.horizontal, 12)
-
-            Picker("Pane", selection: $dashboardPane) {
-                Text("Live").tag(DashboardPane.live)
-                Text("Cached").tag(DashboardPane.cached)
+            Picker("Usage view", selection: $dashboardPane) {
+                Text("Overview").tag(DashboardPane.live)
+                Text("Accounts").tag(DashboardPane.cached)
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .controlSize(.small)
-            .padding(.horizontal, 12)
-            .padding(.top, 8)
+            .controlSize(.regular)
+            .padding(.horizontal, 14)
+            .padding(.bottom, 4)
 
             // Content
             if dashboardPane == .cached {
@@ -142,11 +126,11 @@ public struct MenuBarPopover: View {
                 .padding(.horizontal, 8)
 
             HStack(spacing: 12) {
-                if let last = dashboardVM.lastRefreshed {
+                if dashboardPane == .live, let last = dashboardVM.lastRefreshed {
                     TimelineView(.periodic(from: .now, by: 15)) { _ in
                         Text("Updated \(last.formatted(.relative(presentation: .named)))")
                             .font(.system(size: 10, design: .rounded))
-                            .foregroundStyle(.quaternary)
+                            .foregroundStyle(.secondary)
                     }
                 }
 
@@ -162,6 +146,7 @@ public struct MenuBarPopover: View {
                         .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("Settings")
                 .help("Settings")
 
                 Button {
@@ -172,6 +157,7 @@ public struct MenuBarPopover: View {
                         .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("Quit LLMits")
                 .help("Quit LLMits")
             }
             .padding(.horizontal, 16)
